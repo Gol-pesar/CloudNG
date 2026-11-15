@@ -5,9 +5,10 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.delay
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
 import java.io.ByteArrayOutputStream
@@ -37,8 +38,11 @@ class RawWebSocket(
     private val output = BufferedOutputStream(socket.getOutputStream(), 65536)
     private val writeLock = Any()
     private val closed = AtomicBoolean(false)
-    private val rng = SecureRandom()
     val createdAtMs: Long = System.currentTimeMillis()
+
+    companion object {
+        private val sharedRng = SecureRandom()
+    }
 
     fun isClosed(): Boolean = closed.get() || socket.isClosed
 
@@ -54,7 +58,7 @@ class RawWebSocket(
         if (closed.get()) return false
         return try {
             val mask = ByteArray(4)
-            rng.nextBytes(mask)
+            sharedRng.nextBytes(mask)
 
             val headerSize = when {
                 length < 126 -> 2 + 4
@@ -114,7 +118,7 @@ class RawWebSocket(
             if (closed.get()) return
             runCatching {
                 val mask = ByteArray(4)
-                rng.nextBytes(mask)
+                sharedRng.nextBytes(mask)
                 val len = payload.size.coerceAtMost(125)
                 val hdr = ByteArray(2 + 4 + len)
                 hdr[0] = (0x80 or opcode).toByte()
@@ -246,7 +250,7 @@ class WorkerTunnelSession(
  * execute in 1 RTT (with 0-RTT ClientHello inside buildInit) instead of waiting for TLS+WS setup.
  */
 object WorkerWsPool {
-    private const val POOL_SIZE = 3
+    private const val POOL_SIZE = 4
     private const val MAX_IDLE_AGE_MS = 12_000L
 
     private data class PoolConfig(
@@ -257,6 +261,7 @@ object WorkerWsPool {
 
     private val poolScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val warmSockets = ConcurrentLinkedDeque<RawWebSocket>()
+    private val refillSignal = Channel<Unit>(Channel.CONFLATED)
     @Volatile
     private var activeConfig: PoolConfig? = null
     @Volatile
@@ -275,7 +280,10 @@ object WorkerWsPool {
             activeConfig = cfg
         }
         activeProtector = socketProtector
-        if (maintainerJob?.isActive == true) return
+        if (maintainerJob?.isActive == true) {
+            refillSignal.trySend(Unit)
+            return
+        }
         maintainerJob = poolScope.launch {
             while (isActive) {
                 val cur = activeConfig ?: break
@@ -300,7 +308,7 @@ object WorkerWsPool {
                         }
                     }
                 }
-                delay(2500L)
+                withTimeoutOrNull(2500L) { refillSignal.receive() }
             }
         }
     }
@@ -311,6 +319,7 @@ object WorkerWsPool {
         val now = System.currentTimeMillis()
         while (true) {
             val ws = warmSockets.pollFirst() ?: return null
+            refillSignal.trySend(Unit)
             if (!ws.isClosed() && (now - ws.createdAtMs) < MAX_IDLE_AGE_MS) {
                 return ws
             }
@@ -387,13 +396,14 @@ object WorkerWsClient {
         try {
             socketProtector?.invoke(rawSocket)
             rawSocket.tcpNoDelay = true
+            rawSocket.keepAlive = true
             runCatching {
                 rawSocket.receiveBufferSize = 512 * 1024
                 rawSocket.sendBufferSize = 512 * 1024
             }
             rawSocket.connect(
                 InetSocketAddress(connectHost, 443),
-                WorkerDefaults.CONNECT_TIMEOUT_MS.toInt(),
+                6000,
             )
 
             val factory = SSLSocketFactory.getDefault() as SSLSocketFactory
@@ -407,7 +417,7 @@ object WorkerWsClient {
                 }
                 sslSocket.sslParameters = params
             }
-            sslSocket.soTimeout = WorkerDefaults.CONNECT_TIMEOUT_MS.toInt()
+            sslSocket.soTimeout = 8000
             sslSocket.startHandshake()
 
             val verified = HttpsURLConnection.getDefaultHostnameVerifier()

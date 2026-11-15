@@ -321,4 +321,54 @@ class Socks5ProtocolTest {
         assertEquals(3, outBytes[20].toInt() and 0xFF) // Type 3 Unreachable
         assertEquals(3, outBytes[21].toInt() and 0xFF) // Code 3 Port Unreachable
     }
+
+    @Test
+    fun `tun packet engine negotiates tcp window scale on syn-ack`() {
+        val tempOut = java.io.File.createTempFile("tun_syn_test", ".bin")
+        tempOut.deleteOnExit()
+        val fos = java.io.FileOutputStream(tempOut)
+        val scope = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.SupervisorJob())
+        val profile = com.example.data.ProxyProfile(
+            name = "Test",
+            host = "127.0.0.1",
+            port = 1,
+        )
+        val engine = com.example.vpn.TunPacketEngine(
+            scope = scope,
+            profile = profile,
+            dnsServer = "8.8.8.8",
+            remoteDnsOverTcp = true,
+            tunOutput = fos,
+            protectSocket = { true },
+        )
+
+        // Build TCP SYN packet (20 IP + 24 TCP with Window Scale option = 44 bytes)
+        val synPkt = ByteArray(44)
+        synPkt[0] = 0x45
+        synPkt[3] = 44
+        synPkt[8] = 64
+        synPkt[9] = 6 // TCP
+        synPkt[12] = 10; synPkt[13] = 8; synPkt[14] = 0; synPkt[15] = 2
+        synPkt[16] = 93; synPkt[17] = 184.toByte(); synPkt[18] = 216.toByte(); synPkt[19] = 34
+        synPkt[20] = (51000 ushr 8).toByte(); synPkt[21] = (51000 and 0xFF).toByte()
+        synPkt[22] = (443 ushr 8).toByte(); synPkt[23] = (443 and 0xFF).toByte()
+        synPkt[32] = 0x60 // dataOffset = 6 (24 bytes)
+        synPkt[33] = 0x02 // SYN
+        synPkt[34] = 0xFF.toByte(); synPkt[35] = 0xFF.toByte()
+        // Option: NOP (1), WSCALE (3, 3, 6)
+        synPkt[40] = 1; synPkt[41] = 3; synPkt[42] = 3; synPkt[43] = 6
+
+        engine.processPacket(synPkt, synPkt.size)
+        fos.flush()
+        engine.closeAll()
+        fos.close()
+
+        val outBytes = tempOut.readBytes()
+        assertEquals(48, outBytes.size) // 20 IP + 28 TCP (MSS + NOP + WSCALE)
+        assertEquals(6, outBytes[9].toInt() and 0xFF)
+        assertEquals(0x12, outBytes[33].toInt() and 0xFF) // SYN + ACK
+        assertEquals(0x70, outBytes[32].toInt() and 0xFF) // dataOffset = 7 (28 bytes)
+        assertEquals(3, outBytes[45].toInt() and 0xFF) // WSCALE option kind
+        assertEquals(7, outBytes[47].toInt() and 0xFF) // our shift = 7
+    }
 }

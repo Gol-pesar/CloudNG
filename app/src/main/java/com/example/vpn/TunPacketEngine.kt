@@ -3,6 +3,7 @@ package com.example.vpn
 import com.example.data.ProfileType
 import com.example.data.ProxyProfile
 import com.example.network.Socks5Client
+import com.example.worker.WorkerDefaults
 import com.example.worker.WorkerTunnelSession
 import com.example.worker.WorkerWsClient
 import kotlinx.coroutines.CancellationException
@@ -28,8 +29,12 @@ import kotlin.random.Random
 
 /**
  * Xray-style pure-Kotlin userspace IPv4 / TCP / UDP(DNS) + ICMP(QUIC reject) TUN packet engine.
- * Features instant SYN-ACK, duplicate SYN deduplication, 0-RTT initialPayload piggybacking,
- * TCP out-of-order reassembly, DNS caching, and ICMP port-unreachable fast fallback for QUIC.
+ * Features:
+ * - RFC 1323 TCP Window Scaling for high Bandwidth-Delay Product (mobile/long-RTT links)
+ * - Strict downstream peer-window flow control + unacked retransmission (DupACK & RTO)
+ * - Upstream 64KB frame coalescing + receive-window backpressure
+ * - Instant SYN-ACK, duplicate SYN deduplication, TrafficSniffer (TLS SNI / HTTP Host)
+ * - TCP out-of-order reassembly, DNS caching, and ICMP port-unreachable fast fallback for QUIC
  */
 class TunPacketEngine(
     private val scope: CoroutineScope,
@@ -55,14 +60,19 @@ class TunPacketEngine(
         val key: SessionKey,
         val srcIpBytes: ByteArray,
         val dstIpBytes: ByteArray,
+        val clientInitSeq: Long,
         clientNextSeqInit: Long,
         val initialServerSeq: Long,
+        val useWindowScale: Boolean,
+        val clientWindowShift: Int,
+        initialPeerWindowBytes: Long,
     ) {
         val lock = Any()
         var clientNextSeq: Long = clientNextSeqInit
+        var sendBase: Long = (initialServerSeq + 1L) and 0xFFFFFFFFL
         var serverSeq: Long = (initialServerSeq + 1L) and 0xFFFFFFFFL
-        var peerAck: Long = initialServerSeq
-        var peerWindow: Int = 65535
+        var peerWindowBytes: Long = initialPeerWindowBytes
+        var dupAckCount: Int = 0
         var socket: Socket? = null
         var workerSession: WorkerTunnelSession? = null
         var txChannel: Channel<ByteArray>? = null
@@ -71,8 +81,11 @@ class TunPacketEngine(
         val established = AtomicBoolean(false)
         var clientFinReceived = false
         val firstPayloadSignal = CompletableDeferred<Unit>()
+        val ackSignal = Channel<Unit>(Channel.CONFLATED)
+        val pendingTxBytes = AtomicInteger(0)
         val pendingTx = ArrayDeque<ByteArray>()
-        val outOfOrder = TreeMap<Long, ByteArray> { a, b -> (a.toInt() - b.toInt()) }
+        val outOfOrder = TreeMap<Long, ByteArray> { a, b -> Integer.compare(a.toInt() - b.toInt(), 0) }
+        val unacked = TreeMap<Long, ByteArray> { a, b -> Integer.compare(a.toInt() - b.toInt(), 0) }
     }
 
     private val tcpSessions = ConcurrentHashMap<SessionKey, TcpSession>()
@@ -121,7 +134,7 @@ class TunPacketEngine(
         if (dataOffset < 20 || totalLength < ihl + dataOffset) return
 
         val flags = packet[ihl + 13].toInt() and 0xFF
-        val window = readU16(packet, ihl + 14)
+        val rawWindow = readU16(packet, ihl + 14)
         val isSyn = (flags and FLAG_SYN) != 0
         val isAck = (flags and FLAG_ACK) != 0
         val isFin = (flags and FLAG_FIN) != 0
@@ -141,24 +154,35 @@ class TunPacketEngine(
         if (isSyn && !isAck) {
             val existing = tcpSessions[key]
             if (existing != null && !existing.closed.get()) {
-                // Retransmitted SYN: re-acknowledge immediately without killing the active tunnel!
-                sendTcpSynAck(existing, existing.initialServerSeq, existing.clientNextSeq)
-                return
+                if (existing.clientInitSeq == seq) {
+                    // Retransmitted SYN: re-acknowledge immediately without killing the active tunnel
+                    sendTcpSynAck(existing)
+                    return
+                } else {
+                    // Client reused the 4-tuple for a brand-new connection
+                    closeSession(key, sendRst = false)
+                }
             }
 
+            val clientWscale = parseTcpWindowScale(packet, ihl + 20, ihl + dataOffset)
+            val useWscale = clientWscale != null
             val initialServerSeq = (Random.nextInt() and 0x7FFFFFFF).toLong()
             val clientNextSeq = (seq + 1L) and 0xFFFFFFFFL
             val session = TcpSession(
                 key = key,
                 srcIpBytes = srcIpBytes,
                 dstIpBytes = dstIpBytes,
+                clientInitSeq = seq,
                 clientNextSeqInit = clientNextSeq,
                 initialServerSeq = initialServerSeq,
+                useWindowScale = useWscale,
+                clientWindowShift = (clientWscale ?: 0).coerceIn(0, 14),
+                initialPeerWindowBytes = rawWindow.toLong().coerceAtLeast(1400L),
             )
             tcpSessions[key] = session
 
             // Reply SYN-ACK immediately (<1ms) so browser sends TLS ClientHello right away
-            sendTcpSynAck(session, initialServerSeq, clientNextSeq)
+            sendTcpSynAck(session)
 
             val dstHost = InetAddress.getByAddress(dstIpBytes).hostAddress ?: return
             session.readerJob = scope.launch(tunnelDispatcher) {
@@ -177,15 +201,52 @@ class TunPacketEngine(
         var contiguousPayload: ByteArray? = null
         var ackToSend = 0L
         var serverSeqSnap = 0L
+        var windowToAdvertise = 65535
         var sendAck = false
         var establishedNow = false
         var socketToWrite: Socket? = null
         var txChanToWrite: Channel<ByteArray>? = null
+        var fastRetransmitSeq: Long? = null
+        var fastRetransmitPayload: ByteArray? = null
+        var fastRetransmitAck = 0L
 
         synchronized(session.lock) {
             if (isAck) {
-                session.peerAck = ackNum
-                session.peerWindow = window.coerceAtLeast(1400)
+                val scaledWindow = if (session.useWindowScale) {
+                    rawWindow.toLong() shl session.clientWindowShift
+                } else {
+                    rawWindow.toLong()
+                }
+                val prevWindow = session.peerWindowBytes
+                session.peerWindowBytes = scaledWindow
+
+                val ackAdvance = ackNum.toInt() - session.sendBase.toInt()
+                val remainingInFlight = session.serverSeq.toInt() - ackNum.toInt()
+
+                if (ackAdvance > 0 && remainingInFlight >= 0) {
+                    session.sendBase = ackNum
+                    session.dupAckCount = 0
+                    purgeAckedSegmentsLocked(session, ackNum)
+                    session.ackSignal.trySend(Unit)
+                } else if (
+                    ackAdvance == 0 &&
+                    payload.isEmpty() &&
+                    !isFin &&
+                    session.unacked.isNotEmpty() &&
+                    scaledWindow > 0L
+                ) {
+                    session.dupAckCount++
+                    if (session.dupAckCount == 3) {
+                        val firstEntry = session.unacked.firstEntry()
+                        if (firstEntry != null) {
+                            fastRetransmitSeq = firstEntry.key
+                            fastRetransmitPayload = firstEntry.value
+                            fastRetransmitAck = session.clientNextSeq
+                        }
+                    }
+                } else if (prevWindow == 0L && scaledWindow > 0L) {
+                    session.ackSignal.trySend(Unit)
+                }
             }
 
             if (payload.isNotEmpty()) {
@@ -206,12 +267,13 @@ class TunPacketEngine(
                         drainOutOfOrderLocked(session, merged)
                         contiguousPayload = merged.toByteArray()
                     }
-                } else if (diff in 1..2_000_000 && session.outOfOrder.size < 64) {
+                } else if (diff in 1..4_000_000 && session.outOfOrder.size < 128) {
                     session.outOfOrder[seq] = payload
                 }
 
                 val dataReady = contiguousPayload
                 if (dataReady != null && dataReady.isNotEmpty()) {
+                    session.pendingTxBytes.addAndGet(dataReady.size)
                     if (session.established.get()) {
                         establishedNow = true
                         socketToWrite = session.socket
@@ -224,8 +286,19 @@ class TunPacketEngine(
 
                 ackToSend = session.clientNextSeq
                 serverSeqSnap = session.serverSeq
+                windowToAdvertise = computeReceiveWindow(session)
                 sendAck = true
             }
+        }
+
+        if (fastRetransmitPayload != null && fastRetransmitSeq != null) {
+            sendTcpControlPacket(
+                session = session,
+                flags = FLAG_PSH or FLAG_ACK,
+                seq = fastRetransmitSeq!!,
+                ack = fastRetransmitAck,
+                payload = fastRetransmitPayload!!,
+            )
         }
 
         if (sendAck) {
@@ -234,6 +307,7 @@ class TunPacketEngine(
                 flags = FLAG_ACK,
                 seq = serverSeqSnap,
                 ack = ackToSend,
+                window = windowToAdvertise,
                 payload = ByteArray(0),
             )
         }
@@ -245,6 +319,7 @@ class TunPacketEngine(
                 if (socketToWrite != null) {
                     scope.launch(tunnelDispatcher) {
                         runCatching {
+                            session.pendingTxBytes.addAndGet(-readyData.size)
                             val out = socketToWrite!!.getOutputStream()
                             out.write(readyData)
                             out.flush()
@@ -279,12 +354,65 @@ class TunPacketEngine(
                 flags = FLAG_ACK,
                 seq = srvSeq,
                 ack = ackForFin,
+                window = computeReceiveWindow(session),
                 payload = ByteArray(0),
             )
-            // Support TCP half-close: stop upstream writes while keeping downstream reads open until server finishes
             chanToClose?.close()
             if (sockToShutdown != null) {
                 runCatching { sockToShutdown?.shutdownOutput() }
+            }
+        }
+    }
+
+    private fun parseTcpWindowScale(packet: ByteArray, optionsStart: Int, optionsEnd: Int): Int? {
+        var i = optionsStart
+        while (i < optionsEnd) {
+            val kind = packet[i].toInt() and 0xFF
+            when (kind) {
+                0 -> return null // End of options
+                1 -> i++ // NOP
+                else -> {
+                    if (i + 1 >= optionsEnd) return null
+                    val len = packet[i + 1].toInt() and 0xFF
+                    if (len < 2 || i + len > optionsEnd) return null
+                    if (kind == 3 && len == 3) {
+                        return packet[i + 2].toInt() and 0xFF
+                    }
+                    i += len
+                }
+            }
+        }
+        return null
+    }
+
+    private fun computeReceiveWindow(session: TcpSession): Int {
+        val queued = session.pendingTxBytes.get().coerceAtLeast(0)
+        val freeBytes = (MAX_UPSTREAM_BUFFER_BYTES - queued).coerceAtLeast(0)
+        return if (session.useWindowScale) {
+            (freeBytes ushr OUR_WSCALE_SHIFT).coerceIn(0, 65535)
+        } else {
+            freeBytes.coerceIn(0, 65535)
+        }
+    }
+
+    private fun purgeAckedSegmentsLocked(session: TcpSession, ackNum: Long) {
+        val iter = session.unacked.entries.iterator()
+        while (iter.hasNext()) {
+            val entry = iter.next()
+            val segSeq = entry.key
+            val segData = entry.value
+            val segEnd = (segSeq + segData.size.toLong()) and 0xFFFFFFFFL
+            val diffEnd = segEnd.toInt() - ackNum.toInt()
+            if (diffEnd <= 0) {
+                iter.remove()
+            } else {
+                val ackedBytes = ackNum.toInt() - segSeq.toInt()
+                if (ackedBytes > 0 && ackedBytes < segData.size) {
+                    val remaining = segData.copyOfRange(ackedBytes, segData.size)
+                    iter.remove()
+                    session.unacked[ackNum] = remaining
+                }
+                break
             }
         }
     }
@@ -307,8 +435,7 @@ class TunPacketEngine(
     private suspend fun openWorkerTcpTunnel(session: TcpSession, dstHost: String, dstPort: Int) {
         var counted = false
         try {
-            // Wait briefly (max 15ms; returns immediately on first packet) ONLY to sniff TLS SNI / HTTP Host
-            // Keep payload in pendingTx so it is transmitted via sendPlain() AFTER Worker ACK (matching Cl2.py)
+            // Brief peek (max 15ms; wakes immediately on first packet) for TLS SNI / HTTP Host
             withTimeoutOrNull(15L) { session.firstPayloadSignal.await() }
             if (session.closed.get()) return
 
@@ -355,8 +482,13 @@ class TunPacketEngine(
                 }
             }
 
-            for (chunk in remainingPayloads) {
-                if (!wsSession.sendPlain(chunk)) break
+            if (remainingPayloads.isNotEmpty()) {
+                val mergedInit = ByteArrayOutputStream()
+                for (chunk in remainingPayloads) {
+                    session.pendingTxBytes.addAndGet(-chunk.size)
+                    mergedInit.write(chunk)
+                }
+                wsSession.sendPlain(mergedInit.toByteArray())
             }
             if (finAlreadyReceived) {
                 chan.close()
@@ -364,9 +496,20 @@ class TunPacketEngine(
 
             val upJob = scope.launch(tunnelDispatcher) {
                 try {
-                    for (chunk in chan) {
-                        if (session.closed.get()) break
-                        if (!wsSession.sendPlain(chunk)) break
+                    while (!session.closed.get()) {
+                        val first = chan.receiveCatching().getOrNull() ?: break
+                        val prevBuffered = session.pendingTxBytes.getAndAdd(-first.size)
+                        val batch = ByteArrayOutputStream(first.size.coerceAtLeast(4096))
+                        batch.write(first)
+                        while (batch.size() < WorkerDefaults.MAX_CHUNK) {
+                            val next = chan.tryReceive().getOrNull() ?: break
+                            session.pendingTxBytes.addAndGet(-next.size)
+                            batch.write(next)
+                        }
+                        if (prevBuffered >= HIGH_BUFFER_THRESHOLD && session.pendingTxBytes.get() < HIGH_BUFFER_THRESHOLD) {
+                            sendWindowUpdateAck(session)
+                        }
+                        if (!wsSession.sendPlain(batch.toByteArray())) break
                     }
                 } catch (_: Throwable) {
                 }
@@ -376,32 +519,12 @@ class TunPacketEngine(
                 val dec = wsSession.readPlain() ?: break
                 if (dec.isEmpty()) continue
                 VpnStateManager.recordRx(dec.size)
-
-                var offset = 0
-                while (offset < dec.size && !session.closed.get()) {
-                    val end = (offset + 1400).coerceAtMost(dec.size)
-                    val slice = dec.copyOfRange(offset, end)
-                    val isLastSlice = end >= dec.size
-                    val seqSnap: Long
-                    val ackSnap: Long
-                    synchronized(session.lock) {
-                        seqSnap = session.serverSeq
-                        ackSnap = session.clientNextSeq
-                        session.serverSeq = (session.serverSeq + slice.size.toLong()) and 0xFFFFFFFFL
-                    }
-                    sendTcpControlPacket(
-                        session = session,
-                        flags = if (isLastSlice) (FLAG_PSH or FLAG_ACK) else FLAG_ACK,
-                        seq = seqSnap,
-                        ack = ackSnap,
-                        payload = slice,
-                    )
-                    offset = end
-                }
+                sendDownstreamWithFlowControl(session, dec)
             }
             upJob.cancel()
 
             if (!session.closed.get()) {
+                drainRemainingUnacked(session)
                 val finSeq: Long
                 val finAck: Long
                 synchronized(session.lock) {
@@ -414,6 +537,7 @@ class TunPacketEngine(
                     flags = FLAG_FIN or FLAG_ACK,
                     seq = finSeq,
                     ack = finAck,
+                    window = computeReceiveWindow(session),
                     payload = ByteArray(0),
                 )
             }
@@ -437,17 +561,15 @@ class TunPacketEngine(
     private suspend fun openSocks5TcpTunnel(session: TcpSession, dstHost: String, dstPort: Int) {
         var counted = false
         try {
-            withTimeoutOrNull(35L) { session.firstPayloadSignal.await() }
+            withTimeoutOrNull(15L) { session.firstPayloadSignal.await() }
             if (session.closed.get()) return
 
-            val initialMerged = ByteArrayOutputStream()
-            synchronized(session.lock) {
-                while (session.pendingTx.isNotEmpty()) {
-                    initialMerged.write(session.pendingTx.removeFirst())
+            val sniffedHost = synchronized(session.lock) {
+                session.pendingTx.firstOrNull()?.let { firstChunk ->
+                    TrafficSniffer.sniffDomain(firstChunk, dstPort)
                 }
             }
-            val initialPayload = initialMerged.toByteArray()
-            val effectiveTargetHost = TrafficSniffer.sniffDomain(initialPayload, dstPort) ?: dstHost
+            val effectiveTargetHost = sniffedHost ?: dstHost
 
             val socket = Socks5Client.connect(
                 proxyHost = profile.host,
@@ -481,10 +603,12 @@ class TunPacketEngine(
                 }
             }
 
-            if (initialPayload.isNotEmpty() || bufferedPayloads.isNotEmpty()) {
+            if (bufferedPayloads.isNotEmpty()) {
                 val out = socket.getOutputStream()
-                if (initialPayload.isNotEmpty()) out.write(initialPayload)
-                for (chunk in bufferedPayloads) out.write(chunk)
+                for (chunk in bufferedPayloads) {
+                    session.pendingTxBytes.addAndGet(-chunk.size)
+                    out.write(chunk)
+                }
                 out.flush()
             }
             if (finAlreadyReceived) {
@@ -492,30 +616,17 @@ class TunPacketEngine(
             }
 
             val input: InputStream = socket.getInputStream()
-            val buffer = ByteArray(1400)
+            val buffer = ByteArray(16384)
             while (!session.closed.get()) {
                 val read = input.read(buffer)
                 if (read <= 0) break
                 val chunk = buffer.copyOf(read)
                 VpnStateManager.recordRx(read)
-
-                val seqSnap: Long
-                val ackSnap: Long
-                synchronized(session.lock) {
-                    seqSnap = session.serverSeq
-                    ackSnap = session.clientNextSeq
-                    session.serverSeq = (session.serverSeq + read.toLong()) and 0xFFFFFFFFL
-                }
-                sendTcpControlPacket(
-                    session = session,
-                    flags = FLAG_PSH or FLAG_ACK,
-                    seq = seqSnap,
-                    ack = ackSnap,
-                    payload = chunk,
-                )
+                sendDownstreamWithFlowControl(session, chunk)
             }
 
             if (!session.closed.get()) {
+                drainRemainingUnacked(session)
                 val finSeq: Long
                 val finAck: Long
                 synchronized(session.lock) {
@@ -528,6 +639,7 @@ class TunPacketEngine(
                     flags = FLAG_FIN or FLAG_ACK,
                     seq = finSeq,
                     ack = finAck,
+                    window = computeReceiveWindow(session),
                     payload = ByteArray(0),
                 )
             }
@@ -546,6 +658,117 @@ class TunPacketEngine(
             if (counted) VpnStateManager.decrementActiveConnections()
             closeSession(session.key, sendRst = false)
         }
+    }
+
+    /**
+     * Slices downstream [data] into <=1400-byte TCP segments while respecting the client's
+     * advertised receive window (`peerWindowBytes`) and retransmitting any dropped packets.
+     */
+    private suspend fun sendDownstreamWithFlowControl(session: TcpSession, data: ByteArray) {
+        var offset = 0
+        var rtoAttempts = 0
+        while (offset < data.size && !session.closed.get()) {
+            var sliceToSend: ByteArray? = null
+            var seqSnap = 0L
+            var ackSnap = 0L
+            var winSnap = 65535
+            var retransmitSeq: Long? = null
+            var retransmitPayload: ByteArray? = null
+
+            synchronized(session.lock) {
+                val inFlight = (session.serverSeq.toInt() - session.sendBase.toInt()).toLong().coerceAtLeast(0L)
+                val availWindow = (session.peerWindowBytes - inFlight).coerceAtLeast(0L)
+                if (availWindow > 0L) {
+                    val maxLen = availWindow.coerceAtMost(1400L).toInt()
+                    val end = (offset + maxLen).coerceAtMost(data.size)
+                    val slice = data.copyOfRange(offset, end)
+                    seqSnap = session.serverSeq
+                    ackSnap = session.clientNextSeq
+                    winSnap = computeReceiveWindow(session)
+                    session.unacked[seqSnap] = slice
+                    session.serverSeq = (session.serverSeq + slice.size.toLong()) and 0xFFFFFFFFL
+                    sliceToSend = slice
+                    offset = end
+                    rtoAttempts = 0
+                } else {
+                    val firstUnacked = session.unacked.firstEntry()
+                    if (firstUnacked != null) {
+                        retransmitSeq = firstUnacked.key
+                        retransmitPayload = firstUnacked.value
+                        ackSnap = session.clientNextSeq
+                        winSnap = computeReceiveWindow(session)
+                    }
+                }
+            }
+
+            if (sliceToSend != null) {
+                val isLast = offset >= data.size
+                sendTcpControlPacket(
+                    session = session,
+                    flags = if (isLast) (FLAG_PSH or FLAG_ACK) else FLAG_ACK,
+                    seq = seqSnap,
+                    ack = ackSnap,
+                    window = winSnap,
+                    payload = sliceToSend!!,
+                )
+            } else {
+                // Wait for client ACK / Window Update, retransmitting oldest unacked segment on timeout
+                val signaled = withTimeoutOrNull(250L) { session.ackSignal.receive() }
+                if (signaled == null && !session.closed.get()) {
+                    rtoAttempts++
+                    if (rtoAttempts > 20) break
+                    if (retransmitPayload != null && retransmitSeq != null) {
+                        sendTcpControlPacket(
+                            session = session,
+                            flags = FLAG_PSH or FLAG_ACK,
+                            seq = retransmitSeq!!,
+                            ack = ackSnap,
+                            window = winSnap,
+                            payload = retransmitPayload!!,
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    private suspend fun drainRemainingUnacked(session: TcpSession) {
+        var attempts = 0
+        while (!session.closed.get() && attempts < 8) {
+            val firstEntry = synchronized(session.lock) { session.unacked.firstEntry() } ?: break
+            val ackSnap = synchronized(session.lock) { session.clientNextSeq }
+            val signaled = withTimeoutOrNull(250L) { session.ackSignal.receive() }
+            if (signaled == null && !session.closed.get()) {
+                attempts++
+                sendTcpControlPacket(
+                    session = session,
+                    flags = FLAG_PSH or FLAG_ACK,
+                    seq = firstEntry.key,
+                    ack = ackSnap,
+                    window = computeReceiveWindow(session),
+                    payload = firstEntry.value,
+                )
+            }
+        }
+    }
+
+    private fun sendWindowUpdateAck(session: TcpSession) {
+        val seqSnap: Long
+        val ackSnap: Long
+        val winSnap: Int
+        synchronized(session.lock) {
+            seqSnap = session.serverSeq
+            ackSnap = session.clientNextSeq
+            winSnap = computeReceiveWindow(session)
+        }
+        sendTcpControlPacket(
+            session = session,
+            flags = FLAG_ACK,
+            seq = seqSnap,
+            ack = ackSnap,
+            window = winSnap,
+            payload = ByteArray(0),
+        )
     }
 
     private fun handleUdpPacket(
@@ -738,6 +961,7 @@ class TunPacketEngine(
         val session = tcpSessions.remove(key) ?: return
         if (session.closed.compareAndSet(false, true)) {
             session.firstPayloadSignal.complete(Unit)
+            session.ackSignal.close()
             if (sendRst) sendRst(session)
             session.txChannel?.close()
             runCatching { session.socket?.close() }
@@ -758,20 +982,31 @@ class TunPacketEngine(
             flags = FLAG_RST or FLAG_ACK,
             seq = seqSnap,
             ack = ackSnap,
+            window = 65535,
             payload = ByteArray(0),
         )
     }
 
-    private fun sendTcpSynAck(session: TcpSession, seq: Long, ack: Long) {
-        val options = byteArrayOf(0x02, 0x04, 0x05, 0x78) // MSS = 1400
+    private fun sendTcpSynAck(session: TcpSession) {
+        // Note: SYN-ACK window is always unscaled per RFC 1323
+        val options = if (session.useWindowScale) {
+            byteArrayOf(
+                0x02, 0x04, 0x05, 0x78, // MSS = 1400
+                0x01, // NOP
+                0x03, 0x03, OUR_WSCALE_SHIFT.toByte(), // Window Scale = 7
+            )
+        } else {
+            byteArrayOf(0x02, 0x04, 0x05, 0x78) // MSS = 1400
+        }
         writeTcpPacketToTun(
             srcIp = session.dstIpBytes,
             srcPort = session.key.dstPort,
             dstIp = session.srcIpBytes,
             dstPort = session.key.srcPort,
-            seq = seq,
-            ack = ack,
+            seq = session.initialServerSeq,
+            ack = session.clientNextSeq,
             flags = FLAG_SYN or FLAG_ACK,
+            window = 65535,
             options = options,
             payload = ByteArray(0),
         )
@@ -782,6 +1017,7 @@ class TunPacketEngine(
         flags: Int,
         seq: Long,
         ack: Long,
+        window: Int = 65535,
         payload: ByteArray,
     ) {
         writeTcpPacketToTun(
@@ -792,6 +1028,7 @@ class TunPacketEngine(
             seq = seq,
             ack = ack,
             flags = flags,
+            window = window,
             options = ByteArray(0),
             payload = payload,
         )
@@ -831,6 +1068,7 @@ class TunPacketEngine(
         seq: Long,
         ack: Long,
         flags: Int,
+        window: Int,
         options: ByteArray,
         payload: ByteArray,
     ) {
@@ -847,7 +1085,7 @@ class TunPacketEngine(
         writeU32(pkt, t + 8, ack)
         pkt[t + 12] = (((tcpHeaderLen / 4) shl 4) and 0xF0).toByte()
         pkt[t + 13] = (flags and 0xFF).toByte()
-        writeU16(pkt, t + 14, 65535)
+        writeU16(pkt, t + 14, window.coerceIn(0, 65535))
         writeU16(pkt, t + 16, 0)
         writeU16(pkt, t + 18, 0)
 
@@ -997,5 +1235,8 @@ class TunPacketEngine(
         private const val FLAG_RST = 0x04
         private const val FLAG_PSH = 0x08
         private const val FLAG_ACK = 0x10
+        private const val OUR_WSCALE_SHIFT = 7
+        private const val MAX_UPSTREAM_BUFFER_BYTES = 2 * 1024 * 1024
+        private const val HIGH_BUFFER_THRESHOLD = 512 * 1024
     }
 }
