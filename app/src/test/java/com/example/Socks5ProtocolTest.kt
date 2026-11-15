@@ -1,0 +1,324 @@
+package com.example
+
+import com.example.network.Socks5Client
+import com.example.network.Socks5Exception
+import com.example.vpn.RouteCalculator
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
+import org.junit.Test
+import java.io.DataInputStream
+import java.net.InetAddress
+import java.net.ServerSocket
+import kotlin.concurrent.thread
+
+class Socks5ProtocolTest {
+
+    @Test
+    fun `socks5 handshake with username password auth and domain connect succeeds`() {
+        val server = ServerSocket(0, 1, InetAddress.getByName("127.0.0.1"))
+        val serverThread = thread {
+            server.use { srv ->
+                srv.accept().use { client ->
+                    val input = DataInputStream(client.getInputStream())
+                    val out = client.getOutputStream()
+
+                    // Read greeting
+                    val ver = input.readUnsignedByte()
+                    val nMethods = input.readUnsignedByte()
+                    val methods = ByteArray(nMethods)
+                    input.readFully(methods)
+                    assertEquals(0x05, ver)
+                    assertTrue(methods.contains(0x02.toByte()))
+
+                    // Select user/pass auth (0x02)
+                    out.write(byteArrayOf(0x05, 0x02))
+                    out.flush()
+
+                    // Read RFC 1929 auth
+                    val authVer = input.readUnsignedByte()
+                    val uLen = input.readUnsignedByte()
+                    val user = ByteArray(uLen).also { input.readFully(it) }.decodeToString()
+                    val pLen = input.readUnsignedByte()
+                    val pass = ByteArray(pLen).also { input.readFully(it) }.decodeToString()
+                    assertEquals(0x01, authVer)
+                    assertEquals("ali", user)
+                    assertEquals("s3cr3t", pass)
+
+                    out.write(byteArrayOf(0x01, 0x00))
+                    out.flush()
+
+                    // Read CONNECT request
+                    assertEquals(0x05, input.readUnsignedByte())
+                    assertEquals(0x01, input.readUnsignedByte())
+                    assertEquals(0x00, input.readUnsignedByte())
+                    val atyp = input.readUnsignedByte()
+                    assertEquals(0x03, atyp)
+                    val dLen = input.readUnsignedByte()
+                    val domain = ByteArray(dLen).also { input.readFully(it) }.decodeToString()
+                    val port = input.readUnsignedShort()
+                    assertEquals("example.com", domain)
+                    assertEquals(443, port)
+
+                    // Reply success
+                    out.write(byteArrayOf(0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0))
+                    out.flush()
+
+                    // Echo payload
+                    val buf = ByteArray(4)
+                    input.readFully(buf)
+                    out.write(buf)
+                    out.flush()
+                }
+            }
+        }
+
+        val socket = Socks5Client.connect(
+            proxyHost = "127.0.0.1",
+            proxyPort = server.localPort,
+            username = "ali",
+            password = "s3cr3t",
+            useAuth = true,
+            targetHost = "example.com",
+            targetPort = 443,
+            timeoutMs = 4000,
+        )
+        socket.use { s ->
+            s.getOutputStream().write("PING".toByteArray())
+            s.getOutputStream().flush()
+            val resp = ByteArray(4)
+            DataInputStream(s.getInputStream()).readFully(resp)
+            assertEquals("PING", resp.decodeToString())
+        }
+        serverThread.join(3000)
+    }
+
+    @Test(expected = Socks5Exception::class)
+    fun `socks5 rejects bad credentials with Socks5Exception`() {
+        val server = ServerSocket(0, 1, InetAddress.getByName("127.0.0.1"))
+        val serverThread = thread {
+            server.use { srv ->
+                srv.accept().use { client ->
+                    val input = DataInputStream(client.getInputStream())
+                    val out = client.getOutputStream()
+                    input.readUnsignedByte()
+                    val nMethods = input.readUnsignedByte()
+                    input.readFully(ByteArray(nMethods))
+                    out.write(byteArrayOf(0x05, 0x02))
+                    out.flush()
+
+                    input.readUnsignedByte()
+                    val uLen = input.readUnsignedByte()
+                    input.readFully(ByteArray(uLen))
+                    val pLen = input.readUnsignedByte()
+                    input.readFully(ByteArray(pLen))
+                    out.write(byteArrayOf(0x01, 0x01)) // auth failed
+                    out.flush()
+                }
+            }
+        }
+        try {
+            Socks5Client.connect(
+                proxyHost = "127.0.0.1",
+                proxyPort = server.localPort,
+                username = "wrong",
+                password = "bad",
+                useAuth = true,
+                targetHost = "1.1.1.1",
+                targetPort = 80,
+                timeoutMs = 3000,
+            )
+        } finally {
+            serverThread.join(2000)
+        }
+    }
+
+    @Test
+    fun `route calculator excludes RFC1918 private ranges`() {
+        val blocks = RouteCalculator.publicRoutesExcludingPrivate()
+        assertTrue(blocks.isNotEmpty())
+        assertFalse(blocks.any { it.address == "192.168.0.0" && it.prefix == 16 })
+        assertFalse(blocks.any { it.address == "10.0.0.0" && it.prefix == 8 })
+        assertFalse(blocks.any { it.address == "172.16.0.0" && it.prefix == 12 })
+    }
+
+    @Test
+    fun `worker crypto init packet structure and xor roundtrip are valid`() {
+        val uuid = com.example.worker.WorkerDefaults.UUID_STR
+        val pkt = com.example.worker.WorkerCrypto.buildInit(uuid, "example.com", 443, byteArrayOf(1, 2, 3))
+        assertEquals(16, pkt.key.size)
+        // 16 nonce + (1 ver + 2 port + 1 atyp + 1 len + 11 domain + 3 payload) + 8 mac = 43 bytes
+        assertEquals(16 + 19 + 8, pkt.data.size)
+
+        val plain = "Hello Worker Tunnel!".toByteArray()
+        val enc = com.example.worker.WorkerCrypto.xorWithKey(plain, pkt.key)
+        val dec = com.example.worker.WorkerCrypto.xorWithKey(enc, pkt.key)
+        assertTrue(plain.contentEquals(dec))
+
+        val ack = com.example.worker.WorkerCrypto.expectedAck(pkt.key)
+        assertEquals(16, ack.size)
+    }
+
+    @Test
+    fun `traffic sniffer extracts TLS SNI and HTTP Host`() {
+        val hostBytes = "www.wikipedia.org".toByteArray(Charsets.US_ASCII)
+        val sniEntry = ByteArray(3 + hostBytes.size)
+        sniEntry[0] = 0x00 // host_name
+        sniEntry[1] = 0x00
+        sniEntry[2] = hostBytes.size.toByte()
+        System.arraycopy(hostBytes, 0, sniEntry, 3, hostBytes.size)
+
+        val sniExtPayload = ByteArray(2 + sniEntry.size)
+        sniExtPayload[0] = 0x00
+        sniExtPayload[1] = sniEntry.size.toByte()
+        System.arraycopy(sniEntry, 0, sniExtPayload, 2, sniEntry.size)
+
+        val extBlock = ByteArray(4 + sniExtPayload.size)
+        extBlock[0] = 0x00; extBlock[1] = 0x00 // server_name ext
+        extBlock[2] = 0x00; extBlock[3] = sniExtPayload.size.toByte()
+        System.arraycopy(sniExtPayload, 0, extBlock, 4, sniExtPayload.size)
+
+        // Build minimal TLS 1.2 ClientHello
+        val body = java.io.ByteArrayOutputStream()
+        body.write(byteArrayOf(0x03, 0x03)) // TLS 1.2
+        body.write(ByteArray(32)) // random
+        body.write(0x00) // session id len = 0
+        body.write(byteArrayOf(0x00, 0x02, 0x13, 0x01)) // cipher suites
+        body.write(byteArrayOf(0x01, 0x00)) // compression methods
+        body.write(byteArrayOf(0x00, extBlock.size.toByte())) // extensions len
+        body.write(extBlock)
+        val bodyBytes = body.toByteArray()
+
+        val hsLen = bodyBytes.size
+        val recLen = 4 + hsLen
+        val clientHello = ByteArray(5 + recLen)
+        clientHello[0] = 0x16 // Handshake
+        clientHello[1] = 0x03; clientHello[2] = 0x01
+        clientHello[3] = ((recLen ushr 8) and 0xFF).toByte()
+        clientHello[4] = (recLen and 0xFF).toByte()
+        clientHello[5] = 0x01 // ClientHello
+        clientHello[6] = 0x00
+        clientHello[7] = ((hsLen ushr 8) and 0xFF).toByte()
+        clientHello[8] = (hsLen and 0xFF).toByte()
+        System.arraycopy(bodyBytes, 0, clientHello, 9, bodyBytes.size)
+
+        assertEquals("www.wikipedia.org", com.example.vpn.TrafficSniffer.sniffDomain(clientHello, 443))
+
+        val httpReq = "GET /index.html HTTP/1.1\r\nHost: example.org:8080\r\nConnection: close\r\n\r\n"
+            .toByteArray(Charsets.US_ASCII)
+        assertEquals("example.org", com.example.vpn.TrafficSniffer.sniffDomain(httpReq, 80))
+    }
+
+    @Test
+    fun `raw websocket exchanges xor binary frames and auto replies pong to ping`() {
+        val server = ServerSocket(0, 1, InetAddress.getByName("127.0.0.1"))
+        val xorKey = ByteArray(16) { (it * 7 + 3).toByte() }
+        val serverThread = thread {
+            server.use { srv ->
+                srv.accept().use { peer ->
+                    val input = DataInputStream(peer.getInputStream())
+                    val out = peer.getOutputStream()
+
+                    // Read masked client binary frame
+                    val b0 = input.readUnsignedByte()
+                    val b1 = input.readUnsignedByte()
+                    assertEquals(0x82, b0)
+                    assertTrue((b1 and 0x80) != 0)
+                    val len = b1 and 0x7F
+                    val mask = ByteArray(4).also { input.readFully(it) }
+                    val payload = ByteArray(len).also { input.readFully(it) }
+                    for (i in payload.indices) {
+                        payload[i] = (payload[i].toInt() xor mask[i and 3].toInt() xor xorKey[i and 15].toInt()).toByte()
+                    }
+                    assertEquals("fast-xray-kotlin", payload.decodeToString())
+
+                    // Send PING (0x89)
+                    out.write(byteArrayOf(0x89.toByte(), 0x02, 0x41, 0x42))
+                    out.flush()
+
+                    // Verify client sends PONG (0x8A) masked with "AB"
+                    val pb0 = input.readUnsignedByte()
+                    val pb1 = input.readUnsignedByte()
+                    assertEquals(0x8A, pb0)
+                    assertEquals(0x82, pb1)
+                    val pMask = ByteArray(4).also { input.readFully(it) }
+                    val pData = ByteArray(2).also { input.readFully(it) }
+                    for (i in pData.indices) {
+                        pData[i] = (pData[i].toInt() xor pMask[i and 3].toInt()).toByte()
+                    }
+                    assertEquals("AB", pData.decodeToString())
+
+                    // Send unmasked server binary frame (XOR encrypted)
+                    val reply = "ACK-OK".toByteArray()
+                    val enc = com.example.worker.WorkerCrypto.xorWithKey(reply, xorKey)
+                    out.write(byteArrayOf(0x82.toByte(), enc.size.toByte()))
+                    out.write(enc)
+                    out.flush()
+                }
+            }
+        }
+
+        val sock = java.net.Socket("127.0.0.1", server.localPort)
+        val ws = com.example.worker.RawWebSocket(sock)
+        ws.useCompat {
+            assertTrue(ws.sendBinary("fast-xray-kotlin".toByteArray(), xorKey = xorKey))
+            val msg = ws.readMessage(xorKey = xorKey)
+            assertEquals("ACK-OK", msg?.decodeToString())
+        }
+        serverThread.join(3000)
+    }
+
+    private inline fun com.example.worker.RawWebSocket.useCompat(block: () -> Unit) {
+        try {
+            block()
+        } finally {
+            close()
+        }
+    }
+
+    @Test
+    fun `tun packet engine sends syn-ack and icmp port unreachable for quic`() {
+        val tempOut = java.io.File.createTempFile("tun_out_test", ".bin")
+        tempOut.deleteOnExit()
+        val fos = java.io.FileOutputStream(tempOut)
+        val scope = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.SupervisorJob())
+        val profile = com.example.data.ProxyProfile(
+            name = "Test",
+            host = "127.0.0.1",
+            port = 1,
+        )
+        val engine = com.example.vpn.TunPacketEngine(
+            scope = scope,
+            profile = profile,
+            dnsServer = "8.8.8.8",
+            remoteDnsOverTcp = true,
+            tunOutput = fos,
+            protectSocket = { true },
+        )
+
+        // Build UDP packet to port 443 (QUIC)
+        val udpPkt = ByteArray(28)
+        udpPkt[0] = 0x45
+        udpPkt[3] = 28
+        udpPkt[8] = 64
+        udpPkt[9] = 17 // UDP
+        // src 10.8.0.2 -> dst 8.8.8.8
+        udpPkt[12] = 10; udpPkt[13] = 8; udpPkt[14] = 0; udpPkt[15] = 2
+        udpPkt[16] = 8; udpPkt[17] = 8; udpPkt[18] = 8; udpPkt[19] = 8
+        // srcPort 50000 -> dstPort 443
+        udpPkt[20] = (50000 ushr 8).toByte(); udpPkt[21] = (50000 and 0xFF).toByte()
+        udpPkt[22] = (443 ushr 8).toByte(); udpPkt[23] = (443 and 0xFF).toByte()
+        udpPkt[25] = 8 // udpLen = 8
+
+        engine.processPacket(udpPkt, udpPkt.size)
+        fos.flush()
+        engine.closeAll()
+        fos.close()
+
+        val outBytes = tempOut.readBytes()
+        assertEquals(56, outBytes.size) // 20 IP + 8 ICMP + 28 quoted
+        assertEquals(1, outBytes[9].toInt() and 0xFF) // ICMP protocol
+        assertEquals(3, outBytes[20].toInt() and 0xFF) // Type 3 Unreachable
+        assertEquals(3, outBytes[21].toInt() and 0xFF) // Code 3 Port Unreachable
+    }
+}

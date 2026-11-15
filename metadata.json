@@ -1,0 +1,6 @@
+{
+  "name": "SocksGuard",
+  "description": "کلاینت حرفه‌ای پروکسی SOCKS5 با تونل VPN داخلی، تست پینگ واقعی، مانیتور ترافیک و مدیریت پروفایل‌ها",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

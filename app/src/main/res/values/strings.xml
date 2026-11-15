@@ -1,0 +1,40 @@
+<resources>
+    <string name="app_name">SocksGuard</string>
+    <string name="nav_connect">اتصال</string>
+    <string name="nav_servers">سرورها</string>
+    <string name="nav_activity">ترافیک و تنظیمات</string>
+
+    <string name="status_disconnected">اتصال برقرار نیست</string>
+    <string name="status_connecting">در حال برقراری تونل…</string>
+    <string name="status_connected">تونل امن فعال است</string>
+    <string name="status_error">خطا در اتصال</string>
+
+    <string name="action_connect">اتصال به پروکسی</string>
+    <string name="action_disconnect">قطع اتصال</string>
+    <string name="action_add_server">افزودن سرور</string>
+    <string name="action_import_uri">ورود از لینک</string>
+    <string name="action_test_ping">تست پینگ</string>
+    <string name="action_save">ذخیره</string>
+    <string name="action_cancel">انصراف</string>
+    <string name="action_delete">حذف</string>
+    <string name="action_edit">ویرایش</string>
+    <string name="action_copy_uri">کپی لینک</string>
+
+    <string name="label_download">دریافت</string>
+    <string name="label_upload">ارسال</string>
+    <string name="label_total_traffic">ترافیک کل</string>
+    <string name="label_duration">مدت اتصال</string>
+    <string name="label_active_connections">اتصالات فعال</string>
+    <string name="label_exit_ip">IP خروجی</string>
+
+    <string name="empty_servers_title">هنوز سرور SOCKS5 اضافه نشده است</string>
+    <string name="empty_servers_subtitle">یک سرور پروکسی جدید اضافه کنید یا لینک socks5:// را از حافظه وارد نمایید.</string>
+
+    <string name="cd_hero_background">تصویر پس‌زمینه شبکه</string>
+    <string name="cd_empty_servers">تصویر سرور بدون اتصال</string>
+    <string name="cd_power_button">دکمه اتصال یا قطع پروکسی</string>
+    <string name="cd_back">بازگشت</string>
+
+    <string name="notif_channel_name">وضعیت تونل SOCKS5</string>
+    <string name="notif_channel_desc">اعلان دائمی هنگام فعال بودن تونل VPN پروکسی SOCKS5</string>
+</resources>
