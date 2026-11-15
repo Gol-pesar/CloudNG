@@ -3,6 +3,6 @@
     <item
         android:width="66dp"
         android:height="66dp"
-        android:drawable="@drawable/ic_socksguard_fg"
+        android:drawable="@drawable/ic_cloud_bolt_fg_1794768545489"
         android:gravity="center" />
 </layer-list>
