@@ -144,7 +144,7 @@ class Socks5ProtocolTest {
 
     @Test
     fun `worker crypto init packet structure and xor roundtrip are valid`() {
-        val uuid = com.example.worker.WorkerDefaults.UUID_STR
+        val uuid = "11111111-2222-3333-4444-555555555555"
         val pkt = com.example.worker.WorkerCrypto.buildInit(uuid, "example.com", 443, byteArrayOf(1, 2, 3))
         assertEquals(16, pkt.key.size)
         // 16 nonce + (1 ver + 2 port + 1 atyp + 1 len + 11 domain + 3 payload) + 8 mac = 43 bytes

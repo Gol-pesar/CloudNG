@@ -86,7 +86,7 @@ object Socks5Diagnostics {
 
     private fun resolveWorkerExitIp(profile: ProxyProfile): String? {
         return runCatching {
-            val req = "GET / HTTP/1.1\r\nHost: api.ipify.org\r\nUser-Agent: SocksGuard/1.0\r\nConnection: close\r\n\r\n"
+            val req = "GET / HTTP/1.1\r\nHost: api.ipify.org\r\nUser-Agent: CloudNG/1.0\r\nConnection: close\r\n\r\n"
             val session = WorkerWsClient.openTunnel(
                 uuid = profile.uuid,
                 workerHost = profile.workerHost,
@@ -129,7 +129,7 @@ object Socks5Diagnostics {
                 targetPort = 80,
                 timeoutMs = 5000,
             ).use { socket ->
-                val req = "GET / HTTP/1.1\r\nHost: api.ipify.org\r\nUser-Agent: SocksGuard/1.0\r\nConnection: close\r\n\r\n"
+                val req = "GET / HTTP/1.1\r\nHost: api.ipify.org\r\nUser-Agent: CloudNG/1.0\r\nConnection: close\r\n\r\n"
                 socket.getOutputStream().write(req.toByteArray(StandardCharsets.US_ASCII))
                 socket.getOutputStream().flush()
 

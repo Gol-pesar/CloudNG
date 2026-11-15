@@ -117,6 +117,9 @@ fun SocksGuardApp(
     var editingProfile by remember { mutableStateOf<ProxyProfile?>(null) }
     var showServerEditor by remember { mutableStateOf(false) }
     var showUriDialog by remember { mutableStateOf(false) }
+    var showQrScanner by remember { mutableStateOf(false) }
+    var qrExportProfile by remember { mutableStateOf<ProxyProfile?>(null) }
+    var showPerAppSheet by remember { mutableStateOf(false) }
     var pendingProfileIdToStart by remember { mutableStateOf<Long?>(null) }
 
     LaunchedEffect(uiState.snackbarMessage) {
@@ -309,6 +312,7 @@ fun SocksGuardApp(
                                         editingProfile = null
                                         showServerEditor = true
                                     },
+                                    onOpenPerAppProxy = { showPerAppSheet = true },
                                     onProbeSelected = viewModel::probeProfile,
                                     onShowMessage = viewModel::showMessage,
                                 )
@@ -333,6 +337,8 @@ fun SocksGuardApp(
                                     onDeleteProfile = viewModel::deleteProfile,
                                     onProbeProfile = viewModel::probeProfile,
                                     onImportUriClick = { showUriDialog = true },
+                                    onScanQrClick = { showQrScanner = true },
+                                    onShowQrClick = { profile -> qrExportProfile = profile },
                                     onCopiedMessage = viewModel::showMessage,
                                 )
                             }
@@ -345,6 +351,7 @@ fun SocksGuardApp(
                                     onSetBypassLan = viewModel::setBypassLan,
                                     onSetRemoteDnsOverTcp = viewModel::setRemoteDnsOverTcp,
                                     onSetThemePreference = viewModel::setThemePreference,
+                                    onOpenPerAppProxy = { showPerAppSheet = true },
                                 )
                             }
                         }
@@ -371,6 +378,36 @@ fun SocksGuardApp(
                             showUriDialog = false
                         }
                     },
+                )
+            }
+
+            if (showQrScanner) {
+                QrScannerDialog(
+                    onQrDecoded = { decoded ->
+                        showQrScanner = false
+                        viewModel.importFromUri(decoded)
+                    },
+                    onErrorMessage = viewModel::showMessage,
+                    onDismiss = { showQrScanner = false },
+                )
+            }
+
+            qrExportProfile?.let { profileToExport ->
+                QrExportDialog(
+                    profile = profileToExport,
+                    onCopiedMessage = viewModel::showMessage,
+                    onDismiss = { qrExportProfile = null },
+                )
+            }
+
+            if (showPerAppSheet) {
+                PerAppProxySheet(
+                    currentMode = uiState.settings.perAppMode,
+                    selectedPackages = uiState.settings.perAppPackages,
+                    onChangeMode = viewModel::setPerAppMode,
+                    onTogglePackage = viewModel::togglePerAppPackage,
+                    onClearSelection = { viewModel.setPerAppPackages(emptySet()) },
+                    onDismiss = { showPerAppSheet = false },
                 )
             }
         }

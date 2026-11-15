@@ -454,9 +454,9 @@ fun ServerEditorSheet(
     var showPassword by remember { mutableStateOf(false) }
 
     // Worker WS fields
-    var uuid by remember(initialProfile) { mutableStateOf(initialProfile?.uuid ?: WorkerDefaults.UUID_STR) }
-    var workerHost by remember(initialProfile) { mutableStateOf(initialProfile?.workerHost ?: WorkerDefaults.WORKER_HOST) }
-    var cleanIp by remember(initialProfile) { mutableStateOf(initialProfile?.cleanIp ?: WorkerDefaults.CLEAN_IP) }
+    var uuid by remember(initialProfile) { mutableStateOf(initialProfile?.uuid ?: "") }
+    var workerHost by remember(initialProfile) { mutableStateOf(initialProfile?.workerHost ?: "") }
+    var cleanIp by remember(initialProfile) { mutableStateOf(initialProfile?.cleanIp ?: "") }
     var subproto by remember(initialProfile) { mutableStateOf(initialProfile?.subproto ?: WorkerDefaults.SUBPROTO) }
     var localPortText by remember(initialProfile) {
         mutableStateOf((initialProfile?.localPort ?: WorkerDefaults.LISTEN_PORT).toString())
@@ -608,7 +608,7 @@ fun ServerEditorSheet(
                             value = cleanIp,
                             onValueChange = { cleanIp = it },
                             label = { Text("Clean IP (آی‌پی تمیز)") },
-                            placeholder = { Text("172.67.70.244") },
+                            placeholder = { Text("172.67.x.x") },
                             singleLine = true,
                             modifier = Modifier
                                 .weight(0.62f)
@@ -879,11 +879,11 @@ fun UriImportDialog(
 
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("ورود سریع از لینک") },
+        title = { Text("ورود کانفیگ از کلیپ‌بورد / لینک") },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 Text(
-                    text = "فرمت‌های پشتیبانی‌شده:\nws-socks://UUID@worker.dev?cleanIp=...\nsocks5://user:pass@host:1080\ntg://socks?server=...&port=...",
+                    text = "فرمت استاندارد CloudNG:\namir://UUID@worker.dev?type=ws&cleanIp=...\namir://user:pass@host:1080?type=socks5\nپشتیبانی از ورود چند کانفیگ همزمان (هر خط یک لینک)",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -891,9 +891,9 @@ fun UriImportDialog(
                     OutlinedTextField(
                         value = uriText,
                         onValueChange = { uriText = it },
-                        label = { Text("لینک یا مشخصات سرور") },
-                        minLines = 2,
-                        maxLines = 4,
+                        label = { Text("لینک amir:// یا مشخصات سرور") },
+                        minLines = 3,
+                        maxLines = 5,
                         trailingIcon = {
                             IconButton(
                                 onClick = {
@@ -907,6 +907,22 @@ fun UriImportDialog(
                             .fillMaxWidth()
                             .testTag("uri_import_input"),
                     )
+                }
+                OutlinedButton(
+                    onClick = {
+                        val clip = clipboard.getText()?.text.orEmpty()
+                        if (clip.isNotBlank()) {
+                            onImport(clip)
+                        }
+                    },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(48.dp)
+                        .testTag("paste_and_import_clipboard_button"),
+                ) {
+                    Icon(Icons.Filled.ContentPaste, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(Modifier.width(6.dp))
+                    Text("خواندن مستقیم از کلیپ‌بورد و افزودن")
                 }
             }
         },

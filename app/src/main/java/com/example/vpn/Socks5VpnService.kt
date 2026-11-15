@@ -14,6 +14,7 @@ import androidx.core.app.NotificationCompat
 import com.example.MainActivity
 import com.example.R
 import com.example.data.AppDatabase
+import com.example.data.PerAppMode
 import com.example.data.ProfileType
 import com.example.data.ProxyProfile
 import com.example.data.UserPreferences
@@ -88,6 +89,8 @@ class Socks5VpnService : VpnService() {
                 }
                 val settings = prefs.settings.first()
                 VpnStateManager.onConnecting(profile.id, profile.name, profile.endpoint)
+                val vpnProtector: (java.net.Socket) -> Boolean = { sock -> protect(sock) }
+                VpnSocketProtector.activeProtector = vpnProtector
 
                 // Verify upstream handshake before bringing up TUN routes
                 if (profile.profileType == ProfileType.WORKER_WS) {
@@ -103,6 +106,7 @@ class Socks5VpnService : VpnService() {
                         subproto = profile.subproto,
                         targetHost = probeDns,
                         targetPort = 53,
+                        socketProtector = vpnProtector,
                     ).close()
                 } else {
                     Socks5Client.connect(
@@ -114,11 +118,17 @@ class Socks5VpnService : VpnService() {
                         targetHost = settings.dnsServer,
                         targetPort = 53,
                         timeoutMs = 7000,
-                        socketProtector = { sock -> protect(sock) },
+                        socketProtector = vpnProtector,
                     ).use { _ -> }
                 }
 
-                val pfd = establishVpnInterface(profile, settings.dnsServer, settings.bypassLan)
+                val pfd = establishVpnInterface(
+                    profile = profile,
+                    dnsServer = settings.dnsServer,
+                    bypassLan = settings.bypassLan,
+                    perAppMode = settings.perAppMode,
+                    perAppPackages = settings.perAppPackages,
+                )
                 if (pfd == null) {
                     VpnStateManager.onError("ایجاد رابط TUN توسط سیستم‌عامل رد شد.")
                     stopSelf()
@@ -134,13 +144,16 @@ class Socks5VpnService : VpnService() {
                     dnsServer = settings.dnsServer,
                     remoteDnsOverTcp = settings.remoteDnsOverTcp,
                     tunOutput = tunOut,
-                    protectSocket = { sock -> protect(sock) },
+                    protectSocket = vpnProtector,
                 )
                 packetEngine = engine
 
                 // Also expose local 127.0.0.1:<localPort> SOCKS5 listener while VPN is active
                 runCatching {
-                    val srv = LocalSocks5Server(profile = profile)
+                    val srv = LocalSocks5Server(
+                        profile = profile,
+                        socketProtector = vpnProtector,
+                    )
                     srv.start()
                     localSocks5Server = srv
                 }
@@ -150,7 +163,7 @@ class Socks5VpnService : VpnService() {
                         workerHost = profile.workerHost,
                         cleanIp = profile.cleanIp,
                         subproto = profile.subproto,
-                        socketProtector = { sock -> protect(sock) },
+                        socketProtector = vpnProtector,
                     )
                 }
 
@@ -187,14 +200,69 @@ class Socks5VpnService : VpnService() {
         profile: ProxyProfile,
         dnsServer: String,
         bypassLan: Boolean,
+        perAppMode: PerAppMode,
+        perAppPackages: Set<String>,
     ): ParcelFileDescriptor? {
+        val selfPkg = applicationContext.packageName
         val builder = Builder()
-            .setSession("SocksGuard - ${profile.name}")
+            .setSession("CloudNG - ${profile.name}")
             .setMtu(1500)
             .addAddress("10.8.0.2", 24)
             .addDnsServer(dnsServer)
 
-        runCatching { builder.addDisallowedApplication(packageName) }
+        when (perAppMode) {
+            PerAppMode.ALL_APPS -> {
+                val selfBypassed = runCatching { builder.addDisallowedApplication(selfPkg) }.isSuccess
+                if (!selfBypassed) {
+                    runCatching { builder.addDisallowedApplication(packageName) }
+                }
+                VpnStateManager.addLog(LogLevel.INFO, "BYPASS", "خود برنامه ($selfPkg) از تونل Bypass شد.")
+            }
+            PerAppMode.BYPASS_SELECTED -> {
+                runCatching { builder.addDisallowedApplication(selfPkg) }
+                var extraCount = 0
+                for (pkg in perAppPackages) {
+                    val cleanPkg = pkg.trim()
+                    if (cleanPkg.isNotEmpty() && cleanPkg != selfPkg) {
+                        if (runCatching { builder.addDisallowedApplication(cleanPkg) }.isSuccess) {
+                            extraCount++
+                        }
+                    }
+                }
+                VpnStateManager.addLog(
+                    LogLevel.INFO,
+                    "BYPASS",
+                    "خود برنامه + $extraCount برنامه انتخاب‌شده Bypass شدند.",
+                )
+            }
+            PerAppMode.PROXY_SELECTED -> {
+                val allowedApps = perAppPackages
+                    .map { it.trim() }
+                    .filter { it.isNotEmpty() && it != selfPkg }
+                    .distinct()
+                var addedCount = 0
+                for (pkg in allowedApps) {
+                    if (runCatching { builder.addAllowedApplication(pkg) }.isSuccess) {
+                        addedCount++
+                    }
+                }
+                if (addedCount == 0) {
+                    // Never allow self package into TUN when no allowed apps succeeded
+                    runCatching { builder.addDisallowedApplication(selfPkg) }
+                    VpnStateManager.addLog(
+                        LogLevel.WARNING,
+                        "BYPASS",
+                        "هیچ برنامه‌ای برای تونل انتخاب نشد؛ خود برنامه ($selfPkg) Bypass شد.",
+                    )
+                } else {
+                    VpnStateManager.addLog(
+                        LogLevel.INFO,
+                        "PER-APP",
+                        "فقط $addedCount برنامه از تونل عبور می‌کنند (خود برنامه Bypass است).",
+                    )
+                }
+            }
+        }
 
         if (bypassLan) {
             for (cidr in RouteCalculator.publicRoutesExcludingPrivate()) {
@@ -215,6 +283,7 @@ class Socks5VpnService : VpnService() {
     }
 
     private fun stopTunnelResources() {
+        VpnSocketProtector.activeProtector = null
         statsJob?.cancel()
         statsJob = null
         tunnelJob?.cancel()

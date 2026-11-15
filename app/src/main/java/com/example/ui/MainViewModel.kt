@@ -5,6 +5,7 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.data.AppDatabase
 import com.example.data.AppSettings
+import com.example.data.PerAppMode
 import com.example.data.ProxyProfile
 import com.example.data.ProxyRepository
 import com.example.data.ProxyUriParser
@@ -44,12 +45,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val isTestingEndpoint = MutableStateFlow(false)
     private val customEndpointProbe = MutableStateFlow<Socks5ProbeResult?>(null)
     private val snackbarMessage = MutableStateFlow<String?>(null)
-
-    init {
-        viewModelScope.launch {
-            repository.ensureDefaultWorkerProfileSeeded()
-        }
-    }
 
     private data class DiagnosticsUiState(
         val probingIds: Set<Long>,
@@ -129,7 +124,22 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun importFromUri(rawUri: String): Boolean {
-        val parsed = ProxyUriParser.parse(rawUri)
+        val trimmed = rawUri.trim()
+        val lines = trimmed.lineSequence().map { it.trim() }.filter { it.isNotEmpty() }.toList()
+        if (lines.size > 1) {
+            val batch = ProxyUriParser.parseBatch(trimmed)
+            if (batch.isNotEmpty()) {
+                viewModelScope.launch {
+                    val inserted = repository.saveProfiles(batch)
+                    if (uiState.value.settings.activeProfileId == null && inserted.isNotEmpty()) {
+                        repository.setActiveProfileId(inserted.first())
+                    }
+                    snackbarMessage.value = "${batch.size} کانفیگ با موفقیت اضافه شد."
+                }
+                return true
+            }
+        }
+        val parsed = ProxyUriParser.parse(trimmed)
         return parsed.fold(
             onSuccess = { profile ->
                 saveProfile(profile)
@@ -223,6 +233,24 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun setThemePreference(theme: ThemePreference) {
         viewModelScope.launch {
             repository.setThemePreference(theme)
+        }
+    }
+
+    fun setPerAppMode(mode: PerAppMode) {
+        viewModelScope.launch {
+            repository.setPerAppMode(mode)
+        }
+    }
+
+    fun togglePerAppPackage(packageName: String) {
+        viewModelScope.launch {
+            repository.togglePerAppPackage(packageName)
+        }
+    }
+
+    fun setPerAppPackages(packages: Set<String>) {
+        viewModelScope.launch {
+            repository.setPerAppPackages(packages)
         }
     }
 

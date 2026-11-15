@@ -6,9 +6,6 @@ import javax.crypto.Mac
 import javax.crypto.spec.SecretKeySpec
 
 object WorkerDefaults {
-    const val UUID_STR = "63ae8279-fafa-4dd0-b2ef-9d6a4ec3ffdd"
-    const val WORKER_HOST = "twilight-dream-9e3c.aliahmadiphotoofficial.workers.dev"
-    const val CLEAN_IP = "172.67.70.244"
     const val LISTEN_HOST = "127.0.0.1"
     const val LISTEN_PORT = 40446
     const val SUBPROTO = "chat.v2"

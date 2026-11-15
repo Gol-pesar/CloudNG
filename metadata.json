@@ -1,6 +1,6 @@
 {
-  "name": "SocksGuard",
-  "description": "کلاینت حرفه‌ای پروکسی SOCKS5 با تونل VPN داخلی، تست پینگ واقعی، مانیتور ترافیک و مدیریت پروفایل‌ها",
+  "name": "CloudNG",
+  "description": "کلاینت حرفه‌ای تونل Worker WebSocket و پروکسی SOCKS5 با پشتیبانی فرمت amir://، اشتراک‌گذاری QR Code و Per-App Proxy",
   "requestFramePermissions": [],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }

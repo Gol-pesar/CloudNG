@@ -19,6 +19,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowLeft
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Apps
 import androidx.compose.material.icons.filled.ArrowDownward
 import androidx.compose.material.icons.filled.ArrowUpward
 import androidx.compose.material.icons.filled.ContentCopy
@@ -55,6 +56,7 @@ import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.R
+import com.example.data.PerAppMode
 import com.example.data.ProfileType
 import com.example.data.ProxyProfile
 import com.example.data.TunnelOperationMode
@@ -72,6 +74,7 @@ fun ConnectScreen(
     onChangeOperationMode: (TunnelOperationMode) -> Unit,
     onOpenServersTab: () -> Unit,
     onOpenAddServer: () -> Unit,
+    onOpenPerAppProxy: () -> Unit,
     onProbeSelected: (ProxyProfile) -> Unit,
     onShowMessage: (String) -> Unit,
     modifier: Modifier = Modifier,
@@ -257,6 +260,68 @@ fun ConnectScreen(
                                 tint = MaterialTheme.colorScheme.onSurfaceVariant,
                             )
                         }
+                    }
+                }
+
+                // Per-App Proxy Quick Card
+                Surface(
+                    onClick = onOpenPerAppProxy,
+                    shape = MaterialTheme.shapes.medium,
+                    color = MaterialTheme.colorScheme.surface,
+                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.4f)),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("dashboard_per_app_card"),
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 16.dp, vertical = 12.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(12.dp),
+                            modifier = Modifier.weight(1f),
+                        ) {
+                            Surface(
+                                shape = RoundedCornerShape(12.dp),
+                                color = MaterialTheme.colorScheme.secondaryContainer,
+                                modifier = Modifier.size(40.dp),
+                            ) {
+                                Box(contentAlignment = Alignment.Center) {
+                                    Icon(
+                                        imageVector = Icons.Filled.Apps,
+                                        contentDescription = null,
+                                        tint = MaterialTheme.colorScheme.onSecondaryContainer,
+                                    )
+                                }
+                            }
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = "پروکسی تفکیکی برنامه‌ها (Per-App)",
+                                    style = MaterialTheme.typography.titleSmall,
+                                )
+                                val modeText = when (uiState.settings.perAppMode) {
+                                    PerAppMode.ALL_APPS -> "همه برنامه‌ها • خود CloudNG همیشه Bypass است"
+                                    PerAppMode.BYPASS_SELECTED -> "${uiState.settings.perAppPackages.size} برنامه Bypass • خود CloudNG Bypass است"
+                                    PerAppMode.PROXY_SELECTED -> "فقط ${uiState.settings.perAppPackages.size} برنامه انتخابی داخل تونل"
+                                }
+                                Text(
+                                    text = modeText,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                )
+                            }
+                        }
+                        Icon(
+                            imageVector = Icons.AutoMirrored.Filled.KeyboardArrowLeft,
+                            contentDescription = "تنظیم پروکسی برنامه‌ها",
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
                     }
                 }
 

@@ -5,6 +5,8 @@ import androidx.compose.foundation.Image
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -22,14 +24,17 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.ContentCopy
+import androidx.compose.material.icons.filled.ContentPaste
 import androidx.compose.material.icons.filled.DeleteOutline
 import androidx.compose.material.icons.filled.Edit
-import androidx.compose.material.icons.filled.Link
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.NetworkCheck
+import androidx.compose.material.icons.filled.QrCode2
+import androidx.compose.material.icons.filled.QrCodeScanner
 import androidx.compose.material.icons.outlined.RadioButtonUnchecked
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -55,10 +60,12 @@ import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.R
+import com.example.data.ProfileType
 import com.example.data.ProxyProfile
 import com.example.data.ProxyUriParser
 import com.example.ui.theme.JetBrainsMonoFontFamily
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 fun ServersScreen(
     uiState: MainUiState,
@@ -68,6 +75,8 @@ fun ServersScreen(
     onDeleteProfile: (ProxyProfile) -> Unit,
     onProbeProfile: (ProxyProfile) -> Unit,
     onImportUriClick: () -> Unit,
+    onScanQrClick: () -> Unit,
+    onShowQrClick: (ProxyProfile) -> Unit,
     onCopiedMessage: (String) -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -108,21 +117,21 @@ fun ServersScreen(
                         textAlign = TextAlign.Center,
                     )
                     Spacer(modifier = Modifier.height(4.dp))
+                    Button(
+                        onClick = onAddProfile,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(50.dp)
+                            .testTag("empty_add_server_button"),
+                    ) {
+                        Icon(Icons.Filled.Add, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(Modifier.width(6.dp))
+                        Text(stringResource(R.string.action_add_server))
+                    }
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.spacedBy(10.dp),
                     ) {
-                        Button(
-                            onClick = onAddProfile,
-                            modifier = Modifier
-                                .weight(1f)
-                                .height(50.dp)
-                                .testTag("empty_add_server_button"),
-                        ) {
-                            Icon(Icons.Filled.Add, contentDescription = null, modifier = Modifier.size(18.dp))
-                            Spacer(Modifier.width(6.dp))
-                            Text(stringResource(R.string.action_add_server))
-                        }
                         OutlinedButton(
                             onClick = onImportUriClick,
                             modifier = Modifier
@@ -130,9 +139,20 @@ fun ServersScreen(
                                 .height(50.dp)
                                 .testTag("empty_import_uri_button"),
                         ) {
-                            Icon(Icons.Filled.Link, contentDescription = null, modifier = Modifier.size(18.dp))
+                            Icon(Icons.Filled.ContentPaste, contentDescription = null, modifier = Modifier.size(18.dp))
                             Spacer(Modifier.width(6.dp))
-                            Text(stringResource(R.string.action_import_uri))
+                            Text(stringResource(R.string.action_import_uri), maxLines = 1)
+                        }
+                        FilledTonalButton(
+                            onClick = onScanQrClick,
+                            modifier = Modifier
+                                .weight(1f)
+                                .height(50.dp)
+                                .testTag("empty_scan_qr_button"),
+                        ) {
+                            Icon(Icons.Filled.QrCodeScanner, contentDescription = null, modifier = Modifier.size(18.dp))
+                            Spacer(Modifier.width(6.dp))
+                            Text(stringResource(R.string.action_scan_qr), maxLines = 1)
                         }
                     }
                 }
@@ -145,25 +165,50 @@ fun ServersScreen(
                 horizontalAlignment = Alignment.CenterHorizontally,
             ) {
                 item {
-                    Row(
+                    Column(
                         modifier = Modifier
                             .widthIn(max = 640.dp)
                             .fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically,
+                        verticalArrangement = Arrangement.spacedBy(10.dp),
                     ) {
                         Text(
-                            text = "${uiState.profiles.size} سرور ذخیره‌شده",
+                            text = "${uiState.profiles.size} کانفیگ ذخیره‌شده",
                             style = MaterialTheme.typography.titleMedium,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
-                        OutlinedButton(
-                            onClick = onImportUriClick,
-                            modifier = Modifier.testTag("servers_import_uri_button"),
+                        FlowRow(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            verticalArrangement = Arrangement.spacedBy(8.dp),
                         ) {
-                            Icon(Icons.Filled.Link, contentDescription = null, modifier = Modifier.size(18.dp))
-                            Spacer(Modifier.width(6.dp))
-                            Text(stringResource(R.string.action_import_uri))
+                            OutlinedButton(
+                                onClick = onImportUriClick,
+                                modifier = Modifier.testTag("servers_import_uri_button"),
+                            ) {
+                                Icon(Icons.Filled.ContentPaste, contentDescription = null, modifier = Modifier.size(17.dp))
+                                Spacer(Modifier.width(6.dp))
+                                Text(stringResource(R.string.action_import_uri))
+                            }
+                            FilledTonalButton(
+                                onClick = onScanQrClick,
+                                modifier = Modifier.testTag("servers_scan_qr_button"),
+                            ) {
+                                Icon(Icons.Filled.QrCodeScanner, contentDescription = null, modifier = Modifier.size(17.dp))
+                                Spacer(Modifier.width(6.dp))
+                                Text(stringResource(R.string.action_scan_qr))
+                            }
+                            OutlinedButton(
+                                onClick = {
+                                    val exported = ProxyUriParser.toBatchUri(uiState.profiles)
+                                    clipboard.setText(AnnotatedString(exported))
+                                    onCopiedMessage("${uiState.profiles.size} کانفیگ با فرمت amir:// در کلیپ‌بورد کپی شد.")
+                                },
+                                modifier = Modifier.testTag("servers_export_all_button"),
+                            ) {
+                                Icon(Icons.Filled.ContentCopy, contentDescription = null, modifier = Modifier.size(17.dp))
+                                Spacer(Modifier.width(6.dp))
+                                Text(stringResource(R.string.action_export_all))
+                            }
                         }
                     }
                 }
@@ -178,10 +223,11 @@ fun ServersScreen(
                         isProbing = isProbing,
                         onSelect = { onSelectProfile(profile.id) },
                         onProbe = { onProbeProfile(profile) },
+                        onShowQr = { onShowQrClick(profile) },
                         onCopyUri = {
                             val uri = ProxyUriParser.toUri(profile)
                             clipboard.setText(AnnotatedString(uri))
-                            onCopiedMessage("لینک socks5:// در حافظه کپی شد.")
+                            onCopiedMessage("کانفیگ amir:// در کلیپ‌بورد کپی شد.")
                         },
                         onEdit = { onEditProfile(profile) },
                         onDelete = { onDeleteProfile(profile) },
@@ -212,6 +258,7 @@ private fun ServerProfileCard(
     isProbing: Boolean,
     onSelect: () -> Unit,
     onProbe: () -> Unit,
+    onShowQr: () -> Unit,
     onCopyUri: () -> Unit,
     onEdit: () -> Unit,
     onDelete: () -> Unit,
@@ -288,8 +335,9 @@ private fun ServerProfileCard(
                 Row(
                     horizontalArrangement = Arrangement.spacedBy(6.dp),
                     verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier.weight(1f, fill = false),
                 ) {
-                    if (profile.profileType == com.example.data.ProfileType.WORKER_WS) {
+                    if (profile.profileType == ProfileType.WORKER_WS) {
                         TagChip(text = "Worker WS")
                         TagChip(text = ":${profile.localPort}")
                     } else if (profile.useAuth) {
@@ -304,7 +352,6 @@ private fun ServerProfileCard(
 
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(2.dp),
                 ) {
                     IconButton(
                         onClick = onProbe,
@@ -322,6 +369,18 @@ private fun ServerProfileCard(
                                 tint = MaterialTheme.colorScheme.primary,
                             )
                         }
+                    }
+                    IconButton(
+                        onClick = onShowQr,
+                        modifier = Modifier
+                            .size(48.dp)
+                            .testTag("qr_server_${profile.id}"),
+                    ) {
+                        Icon(
+                            Icons.Filled.QrCode2,
+                            contentDescription = stringResource(R.string.action_show_qr),
+                            tint = MaterialTheme.colorScheme.secondary,
+                        )
                     }
                     IconButton(
                         onClick = onCopyUri,

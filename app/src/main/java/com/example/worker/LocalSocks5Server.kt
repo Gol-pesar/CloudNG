@@ -4,6 +4,7 @@ import com.example.data.ProfileType
 import com.example.data.ProxyProfile
 import com.example.network.Socks5Client
 import com.example.vpn.LogLevel
+import com.example.vpn.VpnSocketProtector
 import com.example.vpn.VpnStateManager
 import java.io.InputStream
 import java.io.OutputStream
@@ -22,6 +23,7 @@ class LocalSocks5Server(
     private val profile: ProxyProfile,
     private val listenHost: String = WorkerDefaults.LISTEN_HOST,
     private val listenPort: Int = profile.localPort,
+    private val socketProtector: ((Socket) -> Boolean)? = null,
 ) {
     private val running = AtomicBoolean(false)
     private var serverSocket: ServerSocket? = null
@@ -35,7 +37,12 @@ class LocalSocks5Server(
         serverSocket = srv
 
         if (profile.profileType == ProfileType.WORKER_WS) {
-            WorkerWsPool.startWarming(profile.workerHost, profile.cleanIp, profile.subproto)
+            WorkerWsPool.startWarming(
+                workerHost = profile.workerHost,
+                cleanIp = profile.cleanIp,
+                subproto = profile.subproto,
+                socketProtector = socketProtector ?: VpnSocketProtector.activeProtector,
+            )
         }
 
         VpnStateManager.addLog(
@@ -129,6 +136,7 @@ class LocalSocks5Server(
                 subproto = profile.subproto,
                 targetHost = host,
                 targetPort = port,
+                socketProtector = socketProtector ?: VpnSocketProtector.activeProtector,
             )
         } catch (t: Throwable) {
             runCatching {
@@ -202,6 +210,7 @@ class LocalSocks5Server(
                 targetHost = host,
                 targetPort = port,
                 timeoutMs = 10_000,
+                socketProtector = socketProtector ?: VpnSocketProtector.activeProtector,
             ).use { upstream ->
                 VpnStateManager.incrementActiveConnections()
                 try {

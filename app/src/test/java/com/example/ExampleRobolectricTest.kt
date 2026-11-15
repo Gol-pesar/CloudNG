@@ -16,6 +16,7 @@ class ExampleRobolectricTest {
   fun `read string from context`() {
     val context = ApplicationProvider.getApplicationContext<Context>()
     val appName = context.getString(R.string.app_name)
-    assertEquals("SocksGuard", appName)
+    assertEquals("CloudNG", appName)
+    assertEquals("com.android.cloudng", context.packageName)
   }
 }

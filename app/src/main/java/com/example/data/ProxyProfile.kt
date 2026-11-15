@@ -27,9 +27,9 @@ data class ProxyProfile(
     val useAuth: Boolean = false,
     val udpRelay: Boolean = true,
     // Cloudflare Worker WS Tunnel fields
-    val uuid: String = WorkerDefaults.UUID_STR,
-    val workerHost: String = WorkerDefaults.WORKER_HOST,
-    val cleanIp: String = WorkerDefaults.CLEAN_IP,
+    val uuid: String = "",
+    val workerHost: String = "",
+    val cleanIp: String = "",
     val subproto: String = WorkerDefaults.SUBPROTO,
     val localPort: Int = WorkerDefaults.LISTEN_PORT,
     // Diagnostics cache

@@ -1,6 +1,7 @@
 package com.example.worker
 
 import android.os.Build
+import com.example.vpn.VpnSocketProtector
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -394,7 +395,10 @@ object WorkerWsClient {
     ): RawWebSocket {
         val rawSocket = Socket()
         try {
-            socketProtector?.invoke(rawSocket)
+            val protector = socketProtector ?: VpnSocketProtector.activeProtector
+            if (protector != null && !protector.invoke(rawSocket)) {
+                throw IOException("امکان محافظت سوکت از مسیر VPN وجود ندارد.")
+            }
             rawSocket.tcpNoDelay = true
             rawSocket.keepAlive = true
             runCatching {
@@ -439,7 +443,7 @@ object WorkerWsClient {
             if (subproto.isNotBlank()) {
                 sb.append("Sec-WebSocket-Protocol: ").append(subproto.trim()).append("\r\n")
             }
-            sb.append("User-Agent: SocksGuard/1.0\r\n")
+            sb.append("User-Agent: CloudNG/1.0\r\n")
             sb.append("\r\n")
 
             val out = sslSocket.getOutputStream()

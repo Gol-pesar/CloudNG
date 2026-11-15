@@ -1,5 +1,6 @@
 package com.example.network
 
+import com.example.vpn.VpnSocketProtector
 import java.io.ByteArrayOutputStream
 import java.io.DataInputStream
 import java.io.IOException
@@ -49,7 +50,8 @@ object Socks5Client {
     ): Socket {
         val socket = Socket()
         try {
-            socketProtector?.let { protect ->
+            val protector = socketProtector ?: VpnSocketProtector.activeProtector
+            protector?.let { protect ->
                 if (!protect(socket)) {
                     throw Socks5Exception("امکان محافظت سوکت در سرویس VPN وجود ندارد.")
                 }

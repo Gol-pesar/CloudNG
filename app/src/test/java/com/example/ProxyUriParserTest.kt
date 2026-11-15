@@ -1,7 +1,11 @@
 package com.example
 
+import com.example.data.ProfileType
+import com.example.data.ProxyProfile
 import com.example.data.ProxyUriParser
+import com.example.ui.QrCodeUtils
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -44,24 +48,61 @@ class ProxyUriParserTest {
     }
 
     @Test
-    fun `parses and serializes ws-socks worker uri`() {
-        val original = com.example.data.ProxyProfile(
-            name = "My Worker",
-            profileType = com.example.data.ProfileType.WORKER_WS,
-            uuid = "63ae8279-fafa-4dd0-b2ef-9d6a4ec3ffdd",
-            workerHost = "twilight-dream-9e3c.aliahmadiphotoofficial.workers.dev",
+    fun `exports and parses amir worker ws uri and qr code roundtrip`() {
+        val original = ProxyProfile(
+            name = "My CloudNG Worker",
+            profileType = ProfileType.WORKER_WS,
+            uuid = "11111111-2222-3333-4444-555555555555",
+            workerHost = "edge.example.workers.dev",
             cleanIp = "172.67.70.244",
             subproto = "chat.v2",
             localPort = 40446,
         )
         val uri = ProxyUriParser.toUri(original)
+        assertTrue(uri.startsWith("amir://"))
+
         val parsed = ProxyUriParser.parse(uri).getOrThrow()
-        assertEquals(com.example.data.ProfileType.WORKER_WS, parsed.profileType)
+        assertEquals(ProfileType.WORKER_WS, parsed.profileType)
         assertEquals(original.uuid, parsed.uuid)
         assertEquals(original.workerHost, parsed.workerHost)
         assertEquals(original.cleanIp, parsed.cleanIp)
         assertEquals(original.subproto, parsed.subproto)
         assertEquals(original.localPort, parsed.localPort)
         assertEquals(original.name, parsed.name)
+
+        // Verify QR encode -> decode roundtrip
+        val qrBitmap = QrCodeUtils.generateQrBitmap(uri, 400)
+        assertNotNull(qrBitmap)
+        val decoded = QrCodeUtils.decodeQrFromBitmap(qrBitmap!!)
+        assertEquals(uri, decoded)
+    }
+
+    @Test
+    fun `exports and parses amir standard socks5 uri and batch`() {
+        val socks = ProxyProfile(
+            name = "NL Node",
+            profileType = ProfileType.STANDARD_SOCKS5,
+            host = "203.0.113.10",
+            port = 1080,
+            username = "amir",
+            password = "p@ssword",
+            useAuth = true,
+            udpRelay = true,
+        )
+        val uri = ProxyUriParser.toUri(socks)
+        assertTrue(uri.startsWith("amir://"))
+        val parsed = ProxyUriParser.parse(uri).getOrThrow()
+        assertEquals(ProfileType.STANDARD_SOCKS5, parsed.profileType)
+        assertEquals("203.0.113.10", parsed.host)
+        assertEquals(1080, parsed.port)
+        assertEquals("amir", parsed.username)
+        assertEquals("p@ssword", parsed.password)
+        assertTrue(parsed.useAuth)
+        assertEquals("NL Node", parsed.name)
+
+        val batch = ProxyUriParser.parseBatch("$uri\namir://test-uuid@worker.example.dev?type=ws&cleanIp=1.1.1.1#WS2")
+        assertEquals(2, batch.size)
+        assertEquals(ProfileType.STANDARD_SOCKS5, batch[0].profileType)
+        assertEquals(ProfileType.WORKER_WS, batch[1].profileType)
     }
 }

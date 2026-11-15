@@ -20,6 +20,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Apps
 import androidx.compose.material.icons.filled.CleaningServices
 import androidx.compose.material.icons.filled.Dns
 import androidx.compose.material.icons.filled.Lan
@@ -28,6 +29,7 @@ import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Terminal
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
@@ -55,6 +57,7 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.example.data.PerAppMode
 import com.example.ui.theme.JetBrainsMonoFontFamily
 import com.example.ui.theme.SignalAmber
 import com.example.ui.theme.SignalEmerald
@@ -72,6 +75,7 @@ fun ActivitySettingsScreen(
     onSetBypassLan: (Boolean) -> Unit,
     onSetRemoteDnsOverTcp: (Boolean) -> Unit,
     onSetThemePreference: (ThemePreference) -> Unit,
+    onOpenPerAppProxy: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     var selectedSection by remember { mutableIntStateOf(0) }
@@ -443,6 +447,48 @@ fun ActivitySettingsScreen(
                                     modifier = Modifier.testTag("remote_dns_switch"),
                                 )
                             }
+                        }
+                    }
+
+                    // Per-App Proxy Card
+                    Surface(
+                        shape = MaterialTheme.shapes.medium,
+                        color = MaterialTheme.colorScheme.surface,
+                        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.4f)),
+                    ) {
+                        Column(
+                            modifier = Modifier.padding(16.dp),
+                            verticalArrangement = Arrangement.spacedBy(10.dp),
+                        ) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                ) {
+                                    Icon(Icons.Filled.Apps, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
+                                    Text("پروکسی برنامه‌ها (Per-App Proxy)", style = MaterialTheme.typography.titleMedium)
+                                }
+                                FilledTonalButton(
+                                    onClick = onOpenPerAppProxy,
+                                    modifier = Modifier.testTag("open_per_app_proxy_button"),
+                                ) {
+                                    Text("تنظیم")
+                                }
+                            }
+                            val perAppSummary = when (uiState.settings.perAppMode) {
+                                PerAppMode.ALL_APPS -> "حالت فعلی: همه برنامه‌ها (به جز CloudNG)"
+                                PerAppMode.BYPASS_SELECTED -> "حالت فعلی: دور زدن ${uiState.settings.perAppPackages.size} برنامه + خود CloudNG"
+                                PerAppMode.PROXY_SELECTED -> "حالت فعلی: فقط ${uiState.settings.perAppPackages.size} برنامه انتخاب‌شده"
+                            }
+                            Text(
+                                text = perAppSummary,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
                         }
                     }
 

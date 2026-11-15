@@ -22,6 +22,6 @@ dependencyResolutionManagement {
   }
 }
 
-rootProject.name = "SocksGuard"
+rootProject.name = "CloudNG"
 
 include(":app")
