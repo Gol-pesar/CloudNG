@@ -15,6 +15,7 @@ import com.example.MainActivity
 import com.example.R
 import com.example.data.AppDatabase
 import com.example.data.ProfileType
+import com.example.vpn.LogLevel
 import com.example.vpn.VpnStateManager
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -24,6 +25,7 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * Foreground service running LocalSocks5Server on 127.0.0.1:<localPort>
@@ -32,6 +34,10 @@ import kotlinx.coroutines.launch
 class LocalProxyService : Service() {
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val sessionCounter = AtomicLong(0L)
+    @Volatile
+    private var activeSessionId = 0L
+    private var proxyJob: Job? = null
     private var localServer: LocalSocks5Server? = null
     private var statsJob: Job? = null
 
@@ -62,18 +68,22 @@ class LocalProxyService : Service() {
     }
 
     private fun startProxy(profileId: Long) {
+        val mySessionId = sessionCounter.incrementAndGet()
+        activeSessionId = mySessionId
         stopResources()
         ensureChannel()
         startForegroundCompat(buildNotification("در حال راه‌اندازی پروکسی محلی…"))
 
-        scope.launch {
+        proxyJob = scope.launch {
             try {
                 val profile = AppDatabase.getInstance(applicationContext)
                     .proxyProfileDao()
                     .getById(profileId)
                 if (profile == null) {
-                    VpnStateManager.onError("پروفایل انتخاب‌شده یافت نشد.")
-                    stopSelf()
+                    if (activeSessionId == mySessionId) {
+                        VpnStateManager.onError("پروفایل انتخاب‌شده یافت نشد.")
+                        stopSelf()
+                    }
                     return@launch
                 }
                 val endpointText = if (profile.profileType == ProfileType.WORKER_WS) {
@@ -83,41 +93,61 @@ class LocalProxyService : Service() {
                 }
                 VpnStateManager.onConnecting(profile.id, profile.name, endpointText)
 
-                // Verify Worker WS tunnel against non-Cloudflare endpoint (8.8.8.8:53)
-                if (profile.profileType == ProfileType.WORKER_WS) {
-                    WorkerWsClient.openTunnel(
-                        uuid = profile.uuid,
-                        workerHost = profile.workerHost,
-                        cleanIp = profile.cleanIp,
-                        subproto = profile.subproto,
-                        targetHost = "8.8.8.8",
-                        targetPort = 53,
-                    ).close()
-                }
-
                 val srv = LocalSocks5Server(profile = profile)
                 srv.start()
+                if (activeSessionId != mySessionId) {
+                    srv.stop()
+                    return@launch
+                }
                 localServer = srv
 
                 VpnStateManager.onConnected()
                 updateNotification("پروکسی محلی فعال: 127.0.0.1:${profile.localPort}")
 
+                // Non-blocking background connectivity check
+                if (profile.profileType == ProfileType.WORKER_WS) {
+                    launch {
+                        runCatching {
+                            val t0 = System.nanoTime()
+                            WorkerWsClient.openTunnel(
+                                uuid = profile.uuid,
+                                workerHost = profile.workerHost,
+                                cleanIp = profile.cleanIp,
+                                subproto = profile.subproto,
+                                targetHost = "8.8.8.8",
+                                targetPort = 53,
+                            ).close()
+                            val ms = ((System.nanoTime() - t0) / 1_000_000L).coerceAtLeast(1L)
+                            VpnStateManager.addLog(LogLevel.SUCCESS, "WS", "اتصال Worker تأیید شد (${ms}ms)")
+                        }.onFailure { err ->
+                            VpnStateManager.addLog(
+                                LogLevel.WARNING,
+                                "WS",
+                                "هشدار تست Worker: ${err.localizedMessage ?: "ناموفق"}",
+                            )
+                        }
+                    }
+                }
+
                 statsJob = scope.launch {
-                    while (isActive) {
+                    while (isActive && activeSessionId == mySessionId) {
                         delay(1000L)
                         VpnStateManager.sampleBandwidthTick()
                     }
                 }
             } catch (t: Throwable) {
-                VpnStateManager.onError(t.localizedMessage ?: "خطا در راه‌اندازی پروکسی محلی")
-                stopResources()
-                stopForeground(STOP_FOREGROUND_REMOVE)
-                stopSelf()
+                if (activeSessionId == mySessionId) {
+                    VpnStateManager.onError(t.localizedMessage ?: "خطا در راه‌اندازی پروکسی محلی")
+                    stopResources()
+                    stopForeground(STOP_FOREGROUND_REMOVE)
+                    stopSelf()
+                }
             }
         }
     }
 
     private fun stopProxy(reason: String) {
+        activeSessionId = sessionCounter.incrementAndGet()
         stopResources()
         VpnStateManager.onDisconnected(reason)
         stopForeground(STOP_FOREGROUND_REMOVE)
@@ -127,6 +157,8 @@ class LocalProxyService : Service() {
     private fun stopResources() {
         statsJob?.cancel()
         statsJob = null
+        proxyJob?.cancel()
+        proxyJob = null
         WorkerWsPool.clear()
         localServer?.stop()
         localServer = null
@@ -148,11 +180,11 @@ class LocalProxyService : Service() {
     }
 
     private fun startForegroundCompat(notification: Notification) {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
             startForeground(
                 NOTIFICATION_ID,
                 notification,
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC,
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE,
             )
         } else {
             startForeground(NOTIFICATION_ID, notification)
@@ -177,7 +209,7 @@ class LocalProxyService : Service() {
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
         )
         return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setSmallIcon(R.mipmap.ic_launcher)
+            .setSmallIcon(R.drawable.ic_vpn_notification)
             .setContentTitle(getString(R.string.app_name))
             .setContentText(text)
             .setOngoing(true)

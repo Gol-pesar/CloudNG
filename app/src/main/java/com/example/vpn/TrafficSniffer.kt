@@ -2,8 +2,8 @@ package com.example.vpn
 
 /**
  * Pure-Kotlin Xray-style protocol sniffer for TLS ClientHello SNI and HTTP Host headers.
- * Allows routing by domain name (remote DNS resolution on the Worker/SOCKS5 exit)
- * even when the client connects using an IP address from local/cached/DoH DNS.
+ * Supports multi-segment Post-Quantum TLS 1.3 ClientHello detection so SNI at the end of a
+ * >1400-byte ClientHello is never missed.
  */
 object TrafficSniffer {
 
@@ -18,11 +18,22 @@ object TrafficSniffer {
         "CONNECT ",
     )
 
+    /**
+     * Returns true when [data] begins with a TLS Handshake ClientHello record whose declared
+     * length exceeds [data].size (meaning another TCP segment will complete the ClientHello).
+     */
+    fun isIncompleteTlsClientHello(data: ByteArray): Boolean {
+        if (data.size < 6) return false
+        if ((data[0].toInt() and 0xFF) != 0x16) return false
+        if ((data[1].toInt() and 0xFF) != 0x03) return false
+        if ((data[5].toInt() and 0xFF) != 0x01) return false
+        val recordLen = readU16(data, 3)
+        return recordLen in 40..16384 && (5 + recordLen) > data.size
+    }
+
     fun sniffDomain(payload: ByteArray, dstPort: Int): String? {
         if (payload.isEmpty()) return null
-        // Check TLS ClientHello first (works on 443 and non-standard TLS ports)
         sniffTlsSni(payload)?.let { return it }
-        // Fallback to HTTP Host header on HTTP ports or clear HTTP payloads
         if (dstPort == 80 || dstPort == 8080 || looksLikeHttp(payload)) {
             sniffHttpHost(payload)?.let { return it }
         }
@@ -30,19 +41,18 @@ object TrafficSniffer {
     }
 
     fun sniffTlsSni(data: ByteArray): String? {
-        // Minimum TLS record header (5) + handshake header (4) + ClientHello fixed fields (34)
         if (data.size < 43) return null
-        if ((data[0].toInt() and 0xFF) != 0x16) return null // ContentType = Handshake
+        if ((data[0].toInt() and 0xFF) != 0x16) return null
         val major = data[1].toInt() and 0xFF
-        if (major != 0x03) return null // SSL 3.0 / TLS 1.x
+        if (major != 0x03) return null
 
         val recordLen = readU16(data, 3)
         val recordEnd = (5 + recordLen).coerceAtMost(data.size)
         if (recordEnd < 43) return null
 
         var pos = 5
-        if ((data[pos].toInt() and 0xFF) != 0x01) return null // HandshakeType = ClientHello
-        pos += 4 // skip type(1) + length(3)
+        if ((data[pos].toInt() and 0xFF) != 0x01) return null
+        pos += 4
         if (pos + 34 > recordEnd) return null
 
         pos += 2 // client_version
@@ -75,7 +85,7 @@ object TrafficSniffer {
             pos += 4
             if (pos + extLen > extensionsEnd) break
 
-            if (extType == 0x0000 && extLen >= 5) { // server_name extension
+            if (extType == 0x0000 && extLen >= 5) {
                 val listLen = readU16(data, pos)
                 var sniPos = pos + 2
                 val listEnd = (sniPos + listLen).coerceAtMost(pos + extLen)
@@ -126,8 +136,8 @@ object TrafficSniffer {
 
     private fun isValidDomain(host: String): Boolean {
         if (host.isEmpty() || host.length > 253) return false
-        if (host.all { it.isDigit() || it == '.' }) return false // ignore bare IPv4
-        if (host.contains(':')) return false // ignore IPv6
+        if (host.all { it.isDigit() || it == '.' }) return false
+        if (host.contains(':')) return false
         return host.all { it in 'a'..'z' || it in '0'..'9' || it == '.' || it == '-' || it == '_' }
     }
 

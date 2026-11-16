@@ -371,4 +371,102 @@ class Socks5ProtocolTest {
         assertEquals(3, outBytes[45].toInt() and 0xFF) // WSCALE option kind
         assertEquals(7, outBytes[47].toInt() and 0xFF) // our shift = 7
     }
+
+    @Test
+    fun `traffic sniffer detects incomplete post-quantum tls client hello`() {
+        val partialHello = ByteArray(100)
+        partialHello[0] = 0x16 // Handshake
+        partialHello[1] = 0x03; partialHello[2] = 0x01
+        // Declare record length 1800 bytes (> 100 bytes present)
+        partialHello[3] = (1800 ushr 8).toByte()
+        partialHello[4] = (1800 and 0xFF).toByte()
+        partialHello[5] = 0x01 // ClientHello
+        assertTrue(com.example.vpn.TrafficSniffer.isIncompleteTlsClientHello(partialHello))
+
+        val smallComplete = ByteArray(100)
+        smallComplete[0] = 0x16
+        smallComplete[1] = 0x03; smallComplete[2] = 0x01
+        smallComplete[3] = 0x00; smallComplete[4] = 60
+        smallComplete[5] = 0x01
+        assertFalse(com.example.vpn.TrafficSniffer.isIncompleteTlsClientHello(smallComplete))
+    }
+
+    @Test
+    fun `tun packet engine returns fast empty NOERROR for AAAA dns queries and rejects ipv6 tcp`() {
+        val tempOut = java.io.File.createTempFile("tun_v6_aaaa_test", ".bin")
+        tempOut.deleteOnExit()
+        val fos = java.io.FileOutputStream(tempOut)
+        val scope = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.SupervisorJob())
+        val profile = com.example.data.ProxyProfile(
+            name = "Test",
+            host = "127.0.0.1",
+            port = 1,
+        )
+        val engine = com.example.vpn.TunPacketEngine(
+            scope = scope,
+            profile = profile,
+            dnsServer = "8.8.8.8",
+            remoteDnsOverTcp = true,
+            tunOutput = fos,
+            protectSocket = { true },
+        )
+
+        // Build IPv4 UDP:53 AAAA query for "a.com"
+        val dnsQuery = byteArrayOf(
+            0x12, 0x34, // TXID
+            0x01, 0x00, // RD=1
+            0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x01, 'a'.code.toByte(), 0x03, 'c'.code.toByte(), 'o'.code.toByte(), 'm'.code.toByte(), 0x00,
+            0x00, 28, // QTYPE = AAAA (28)
+            0x00, 1,  // QCLASS = IN (1)
+        )
+        val udpTotal = 20 + 8 + dnsQuery.size
+        val dnsPkt = ByteArray(udpTotal)
+        dnsPkt[0] = 0x45
+        dnsPkt[2] = (udpTotal ushr 8).toByte(); dnsPkt[3] = (udpTotal and 0xFF).toByte()
+        dnsPkt[8] = 64
+        dnsPkt[9] = 17 // UDP
+        dnsPkt[12] = 10; dnsPkt[13] = 8; dnsPkt[14] = 0; dnsPkt[15] = 2
+        dnsPkt[16] = 8; dnsPkt[17] = 8; dnsPkt[18] = 8; dnsPkt[19] = 8
+        dnsPkt[20] = (52000 ushr 8).toByte(); dnsPkt[21] = (52000 and 0xFF).toByte()
+        dnsPkt[22] = 0; dnsPkt[23] = 53
+        val udpLen = 8 + dnsQuery.size
+        dnsPkt[24] = (udpLen ushr 8).toByte(); dnsPkt[25] = (udpLen and 0xFF).toByte()
+        System.arraycopy(dnsQuery, 0, dnsPkt, 28, dnsQuery.size)
+
+        engine.processPacket(dnsPkt, dnsPkt.size)
+
+        // Also send IPv6 TCP SYN (40 IPv6 + 20 TCP = 60 bytes)
+        val tcp6 = ByteArray(60)
+        tcp6[0] = 0x60 // IPv6
+        tcp6[4] = 0; tcp6[5] = 20 // payloadLen = 20
+        tcp6[6] = 6 // TCP
+        tcp6[7] = 64
+        tcp6[23] = 2 // src ::2
+        tcp6[24] = 0x20; tcp6[39] = 1 // dst 2000::1
+        tcp6[40] = (54000 ushr 8).toByte(); tcp6[41] = (54000 and 0xFF).toByte()
+        tcp6[42] = 0x01; tcp6[43] = 0xBB.toByte() // 443
+        tcp6[52] = 0x50 // dataOff=5
+        tcp6[53] = 0x02 // SYN
+        engine.processPacket(tcp6, tcp6.size)
+
+        // Allow writer coroutine a moment then closeAll() flushes remaining
+        Thread.sleep(50L)
+        engine.closeAll()
+        fos.close()
+
+        val outBytes = tempOut.readBytes()
+        // Packet 1 = IPv4 DNS reply (28 + dnsQuery.size), Packet 2 = IPv6 TCP RST+ACK (60)
+        assertEquals(udpTotal + 60, outBytes.size)
+        // Verify DNS QR=1 (0x81) and ANCOUNT=0, RCODE=0
+        assertEquals(0x12, outBytes[28].toInt() and 0xFF)
+        assertEquals(0x34, outBytes[29].toInt() and 0xFF)
+        assertEquals(0x81, outBytes[30].toInt() and 0xFF)
+        assertEquals(0, outBytes[31].toInt() and 0x0F) // NOERROR
+        assertEquals(0, outBytes[35].toInt() and 0xFF) // ANCOUNT = 0
+        // Verify Packet 2 is IPv6 TCP RST+ACK (0x14)
+        assertEquals(6, (outBytes[udpTotal].toInt() ushr 4) and 0x0F)
+        assertEquals(0x14, outBytes[udpTotal + 53].toInt() and 0xFF)
+    }
 }
+

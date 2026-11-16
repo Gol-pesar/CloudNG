@@ -50,14 +50,16 @@ object Socks5Client {
     ): Socket {
         val socket = Socket()
         try {
-            val protector = socketProtector ?: VpnSocketProtector.activeProtector
-            protector?.let { protect ->
-                if (!protect(socket)) {
-                    throw Socks5Exception("امکان محافظت سوکت در سرویس VPN وجود ندارد.")
-                }
+            if (!VpnSocketProtector.protectAndBind(socket, socketProtector)) {
+                throw Socks5Exception("امکان محافظت سوکت در سرویس VPN وجود ندارد.")
             }
             socket.soTimeout = timeoutMs
             socket.tcpNoDelay = true
+            socket.keepAlive = true
+            runCatching {
+                socket.receiveBufferSize = 1024 * 1024
+                socket.sendBufferSize = 1024 * 1024
+            }
             socket.connect(InetSocketAddress(proxyHost, proxyPort), timeoutMs)
 
             val out = socket.getOutputStream()

@@ -7,6 +7,9 @@ import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
 import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
@@ -22,6 +25,7 @@ import com.example.network.Socks5Client
 import com.example.worker.LocalSocks5Server
 import com.example.worker.WorkerWsClient
 import com.example.worker.WorkerWsPool
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -33,10 +37,15 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.io.FileInputStream
 import java.io.FileOutputStream
+import java.io.InterruptedIOException
+import java.util.concurrent.atomic.AtomicLong
 
 class Socks5VpnService : VpnService() {
 
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val sessionCounter = AtomicLong(0L)
+    @Volatile
+    private var activeSessionId = 0L
     private var tunnelJob: Job? = null
     private var statsJob: Job? = null
     private var vpnInterface: ParcelFileDescriptor? = null
@@ -67,12 +76,15 @@ class Socks5VpnService : VpnService() {
     }
 
     override fun onDestroy() {
+        activeSessionId = sessionCounter.incrementAndGet()
         stopTunnelResources()
         serviceScope.cancel()
         super.onDestroy()
     }
 
     private fun startTunnel(profileId: Long) {
+        val mySessionId = sessionCounter.incrementAndGet()
+        activeSessionId = mySessionId
         stopTunnelResources()
         ensureNotificationChannel()
         startForegroundCompat(buildNotification("در حال برقراری تونل…"))
@@ -83,44 +95,36 @@ class Socks5VpnService : VpnService() {
                 val prefs = UserPreferences(applicationContext)
                 val profile = db.proxyProfileDao().getById(profileId)
                 if (profile == null) {
-                    VpnStateManager.onError("پروفایل سرور انتخاب‌شده یافت نشد.")
-                    stopSelf()
+                    if (activeSessionId == mySessionId) {
+                        VpnStateManager.onError("پروفایل سرور انتخاب‌شده یافت نشد.")
+                        stopSelf()
+                    }
                     return@launch
                 }
+
+                if (profile.profileType == ProfileType.WORKER_WS) {
+                    if (profile.workerHost.isBlank() || profile.uuid.isBlank()) {
+                        if (activeSessionId == mySessionId) {
+                            VpnStateManager.onError("مشخصات سرور Worker (آدرس یا UUID) کامل نیست.")
+                            stopSelf()
+                        }
+                        return@launch
+                    }
+                } else if (profile.host.isBlank() || profile.port !in 1..65535) {
+                    if (activeSessionId == mySessionId) {
+                        VpnStateManager.onError("آدرس یا پورت سرور SOCKS5 معتبر نیست.")
+                        stopSelf()
+                    }
+                    return@launch
+                }
+
                 val settings = prefs.settings.first()
                 VpnStateManager.onConnecting(profile.id, profile.name, profile.endpoint)
+
+                val physicalNetwork = findUnderlyingPhysicalNetwork()
                 val vpnProtector: (java.net.Socket) -> Boolean = { sock -> protect(sock) }
                 VpnSocketProtector.activeProtector = vpnProtector
-
-                // Verify upstream handshake before bringing up TUN routes
-                if (profile.profileType == ProfileType.WORKER_WS) {
-                    val probeDns = if (settings.dnsServer == "1.1.1.1" || settings.dnsServer == "1.0.0.1") {
-                        "8.8.8.8"
-                    } else {
-                        settings.dnsServer
-                    }
-                    WorkerWsClient.openTunnel(
-                        uuid = profile.uuid,
-                        workerHost = profile.workerHost,
-                        cleanIp = profile.cleanIp,
-                        subproto = profile.subproto,
-                        targetHost = probeDns,
-                        targetPort = 53,
-                        socketProtector = vpnProtector,
-                    ).close()
-                } else {
-                    Socks5Client.connect(
-                        proxyHost = profile.host,
-                        proxyPort = profile.port,
-                        username = profile.username,
-                        password = profile.password,
-                        useAuth = profile.useAuth,
-                        targetHost = settings.dnsServer,
-                        targetPort = 53,
-                        timeoutMs = 7000,
-                        socketProtector = vpnProtector,
-                    ).use { _ -> }
-                }
+                VpnSocketProtector.underlyingNetwork = physicalNetwork
 
                 val pfd = establishVpnInterface(
                     profile = profile,
@@ -128,10 +132,17 @@ class Socks5VpnService : VpnService() {
                     bypassLan = settings.bypassLan,
                     perAppMode = settings.perAppMode,
                     perAppPackages = settings.perAppPackages,
+                    underlyingNet = physicalNetwork,
                 )
                 if (pfd == null) {
-                    VpnStateManager.onError("ایجاد رابط TUN توسط سیستم‌عامل رد شد.")
-                    stopSelf()
+                    if (activeSessionId == mySessionId) {
+                        VpnStateManager.onError("ایجاد رابط TUN توسط سیستم‌عامل رد شد.")
+                        stopSelf()
+                    }
+                    return@launch
+                }
+                if (activeSessionId != mySessionId || !isActive) {
+                    runCatching { pfd.close() }
                     return@launch
                 }
                 vpnInterface = pfd
@@ -148,7 +159,6 @@ class Socks5VpnService : VpnService() {
                 )
                 packetEngine = engine
 
-                // Also expose local 127.0.0.1:<localPort> SOCKS5 listener while VPN is active
                 runCatching {
                     val srv = LocalSocks5Server(
                         profile = profile,
@@ -170,30 +180,101 @@ class Socks5VpnService : VpnService() {
                 VpnStateManager.onConnected()
                 updateNotification("متصل به ${profile.name} (${profile.endpoint})")
 
+                // Non-blocking background verification so VPN startup never stalls or aborts on slow handshakes
+                launch {
+                    runCatching {
+                        val t0 = System.nanoTime()
+                        if (profile.profileType == ProfileType.WORKER_WS) {
+                            WorkerWsClient.openTunnel(
+                                uuid = profile.uuid,
+                                workerHost = profile.workerHost,
+                                cleanIp = profile.cleanIp,
+                                subproto = profile.subproto,
+                                targetHost = "8.8.8.8",
+                                targetPort = 53,
+                                socketProtector = vpnProtector,
+                            ).close()
+                        } else {
+                            Socks5Client.connect(
+                                proxyHost = profile.host,
+                                proxyPort = profile.port,
+                                username = profile.username,
+                                password = profile.password,
+                                useAuth = profile.useAuth,
+                                targetHost = settings.dnsServer,
+                                targetPort = 53,
+                                timeoutMs = 6000,
+                                socketProtector = vpnProtector,
+                            ).use { _ -> }
+                        }
+                        val ms = ((System.nanoTime() - t0) / 1_000_000L).coerceAtLeast(1L)
+                        VpnStateManager.addLog(LogLevel.SUCCESS, "CORE", "مسیر بالادست آماده است (${ms}ms)")
+                    }.onFailure { err ->
+                        VpnStateManager.addLog(
+                            LogLevel.WARNING,
+                            "CORE",
+                            "هشدار بررسی اولیه مسیر: ${err.localizedMessage ?: "ناموفق"}",
+                        )
+                    }
+                }
+
                 statsJob = serviceScope.launch {
-                    while (isActive) {
+                    while (isActive && activeSessionId == mySessionId) {
                         delay(1000L)
                         VpnStateManager.sampleBandwidthTick()
                     }
                 }
 
                 val buffer = ByteArray(32767)
-                while (isActive) {
-                    val read = tunIn.read(buffer)
+                while (isActive && activeSessionId == mySessionId) {
+                    val read = try {
+                        tunIn.read(buffer)
+                    } catch (_: InterruptedIOException) {
+                        continue
+                    }
                     if (read > 0) {
                         engine.processPacket(buffer, read)
                     } else if (read < 0) {
                         break
                     }
                 }
+            } catch (ce: CancellationException) {
+                throw ce
             } catch (t: Throwable) {
-                VpnStateManager.onError(t.localizedMessage ?: "خطا در برقراری تونل")
+                if (activeSessionId == mySessionId) {
+                    VpnStateManager.onError(t.localizedMessage ?: "خطا در برقراری تونل")
+                }
             } finally {
-                stopTunnelResources()
-                stopForeground(STOP_FOREGROUND_REMOVE)
-                stopSelf()
+                if (activeSessionId == mySessionId) {
+                    stopTunnelResources()
+                    stopForeground(STOP_FOREGROUND_REMOVE)
+                    stopSelf()
+                }
             }
         }
+    }
+
+    private fun findUnderlyingPhysicalNetwork(): Network? {
+        return runCatching {
+            val cm = getSystemService(ConnectivityManager::class.java) ?: return null
+            val active = cm.activeNetwork
+            if (active != null) {
+                val caps = cm.getNetworkCapabilities(active)
+                if (caps != null &&
+                    caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
+                    !caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)
+                ) {
+                    return active
+                }
+            }
+            @Suppress("DEPRECATION")
+            cm.allNetworks.firstOrNull { net ->
+                val caps = cm.getNetworkCapabilities(net)
+                caps != null &&
+                    caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
+                    !caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)
+            }
+        }.getOrNull()
     }
 
     private fun establishVpnInterface(
@@ -202,13 +283,21 @@ class Socks5VpnService : VpnService() {
         bypassLan: Boolean,
         perAppMode: PerAppMode,
         perAppPackages: Set<String>,
+        underlyingNet: Network?,
     ): ParcelFileDescriptor? {
         val selfPkg = applicationContext.packageName
         val builder = Builder()
             .setSession("CloudNG - ${profile.name}")
-            .setMtu(1500)
+            .setMtu(1400)
             .addAddress("10.8.0.2", 24)
             .addDnsServer(dnsServer)
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP_MR1 && underlyingNet != null) {
+            runCatching { builder.setUnderlyingNetworks(arrayOf(underlyingNet)) }
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            runCatching { builder.setMetered(false) }
+        }
 
         when (perAppMode) {
             PerAppMode.ALL_APPS -> {
@@ -247,7 +336,6 @@ class Socks5VpnService : VpnService() {
                     }
                 }
                 if (addedCount == 0) {
-                    // Never allow self package into TUN when no allowed apps succeeded
                     runCatching { builder.addDisallowedApplication(selfPkg) }
                     VpnStateManager.addLog(
                         LogLevel.WARNING,
@@ -272,10 +360,17 @@ class Socks5VpnService : VpnService() {
             builder.addRoute("0.0.0.0", 0)
         }
 
+        // Capture global IPv6 inside TUN so carrier IPv6 cannot leak or stall Happy Eyeballs
+        runCatching {
+            builder.addAddress("fd00:10:8::2", 126)
+            builder.addRoute("2000::", 3)
+        }
+
         return builder.establish()
     }
 
     private fun stopTunnel(reason: String) {
+        activeSessionId = sessionCounter.incrementAndGet()
         stopTunnelResources()
         VpnStateManager.onDisconnected(reason)
         stopForeground(STOP_FOREGROUND_REMOVE)
@@ -284,6 +379,7 @@ class Socks5VpnService : VpnService() {
 
     private fun stopTunnelResources() {
         VpnSocketProtector.activeProtector = null
+        VpnSocketProtector.underlyingNetwork = null
         statsJob?.cancel()
         statsJob = null
         tunnelJob?.cancel()
@@ -313,11 +409,11 @@ class Socks5VpnService : VpnService() {
     }
 
     private fun startForegroundCompat(notification: Notification) {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
             startForeground(
                 NOTIFICATION_ID,
                 notification,
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC,
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE,
             )
         } else {
             startForeground(NOTIFICATION_ID, notification)
@@ -344,7 +440,7 @@ class Socks5VpnService : VpnService() {
         )
 
         return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setSmallIcon(R.mipmap.ic_launcher)
+            .setSmallIcon(R.drawable.ic_vpn_notification)
             .setContentTitle(getString(R.string.app_name))
             .setContentText(contentText)
             .setOngoing(true)

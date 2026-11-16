@@ -8,12 +8,15 @@ import com.example.vpn.VpnSocketProtector
 import com.example.vpn.VpnStateManager
 import java.io.InputStream
 import java.io.OutputStream
+import java.net.BindException
 import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
-import kotlin.concurrent.thread
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * High-throughput local SOCKS5 listener (e.g., 127.0.0.1:40446) bridging local SOCKS5 clients
@@ -28,13 +31,38 @@ class LocalSocks5Server(
     private val running = AtomicBoolean(false)
     private var serverSocket: ServerSocket? = null
     private var acceptThread: Thread? = null
+    private var workerPool: ExecutorService? = null
 
     fun start() {
         if (!running.compareAndSet(false, true)) return
         val srv = ServerSocket()
         srv.reuseAddress = true
-        srv.bind(InetSocketAddress(listenHost, listenPort))
+        var lastBindErr: BindException? = null
+        var bound = false
+        for (attempt in 0 until 5) {
+            try {
+                srv.bind(InetSocketAddress(listenHost, listenPort))
+                bound = true
+                break
+            } catch (e: BindException) {
+                lastBindErr = e
+                Thread.sleep(60L)
+            }
+        }
+        if (!bound) {
+            running.set(false)
+            runCatching { srv.close() }
+            throw lastBindErr ?: BindException("پورت محلی $listenPort در حال استفاده است.")
+        }
         serverSocket = srv
+
+        val threadCounter = AtomicInteger(1)
+        val exec = Executors.newCachedThreadPool { r ->
+            Thread(r, "cloudng-socks-${threadCounter.getAndIncrement()}").apply {
+                isDaemon = true
+            }
+        }
+        workerPool = exec
 
         if (profile.profileType == ProfileType.WORKER_WS) {
             WorkerWsPool.startWarming(
@@ -51,17 +79,22 @@ class LocalSocks5Server(
             "پروکسی محلی SOCKS5 روی $listenHost:$listenPort آماده شد",
         )
 
-        acceptThread = thread(isDaemon = true, name = "socks-accept-$listenPort") {
+        acceptThread = Thread({
             while (running.get()) {
                 val client = try {
                     srv.accept()
                 } catch (_: Exception) {
                     break
                 }
-                thread(isDaemon = true, name = "socks-${client.remoteSocketAddress}") {
-                    handleClient(client)
+                try {
+                    exec.execute { handleClient(client) }
+                } catch (_: Throwable) {
+                    runCatching { client.close() }
                 }
             }
+        }, "socks-accept-$listenPort").apply {
+            isDaemon = true
+            start()
         }
     }
 
@@ -71,14 +104,16 @@ class LocalSocks5Server(
         serverSocket = null
         acceptThread?.interrupt()
         acceptThread = null
+        runCatching { workerPool?.shutdownNow() }
+        workerPool = null
     }
 
     private fun handleClient(cs: Socket) {
         cs.use { s ->
             s.tcpNoDelay = true
             runCatching {
-                s.receiveBufferSize = 512 * 1024
-                s.sendBufferSize = 512 * 1024
+                s.receiveBufferSize = 1024 * 1024
+                s.sendBufferSize = 1024 * 1024
             }
             s.soTimeout = WorkerDefaults.HANDSHAKE_TIMEOUT_MS
             val input = s.getInputStream()
@@ -158,7 +193,8 @@ class LocalSocks5Server(
             output.flush()
             clientSocket.soTimeout = 0
 
-            val downThread = thread(isDaemon = true, name = "ws-down-$host:$port") {
+            val downDone = AtomicBoolean(false)
+            val downTask = workerPool?.submit {
                 try {
                     while (true) {
                         val plain = session.readPlain() ?: break
@@ -170,23 +206,29 @@ class LocalSocks5Server(
                     }
                 } catch (_: Throwable) {
                 } finally {
+                    downDone.set(true)
+                    runCatching { clientSocket.shutdownOutput() }
                     runCatching { clientSocket.close() }
                 }
             }
 
             try {
                 val buf = ByteArray(WorkerDefaults.MAX_CHUNK)
-                while (true) {
+                while (!downDone.get()) {
                     val n = input.read(buf)
                     if (n <= 0) break
                     VpnStateManager.recordTx(n)
-                    if (!session.sendPlain(buf, 0, n)) break
+                    if (!session.sendPlain(buf, 0, n)) {
+                        session.close()
+                        break
+                    }
                 }
             } catch (_: Throwable) {
-            } finally {
                 session.close()
             }
-            downThread.join(1500)
+
+            // Wait for server downstream to finish naturally instead of killing WS on client half-close
+            runCatching { downTask?.get() }
         } finally {
             VpnStateManager.decrementActiveConnections()
             session.close()
@@ -219,7 +261,7 @@ class LocalSocks5Server(
                     clientSocket.soTimeout = 0
                     upstream.soTimeout = 0
 
-                    val tUp = thread(isDaemon = true) {
+                    val upTask = workerPool?.submit {
                         runCatching {
                             val buf = ByteArray(WorkerDefaults.MAX_CHUNK)
                             val upOut = upstream.getOutputStream()
@@ -243,7 +285,7 @@ class LocalSocks5Server(
                         output.write(buf, 0, n)
                         output.flush()
                     }
-                    tUp.join(1000)
+                    runCatching { upTask?.get() }
                 } finally {
                     VpnStateManager.decrementActiveConnections()
                 }

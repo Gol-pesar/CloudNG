@@ -16,6 +16,9 @@ import java.io.ByteArrayOutputStream
 import java.io.DataInputStream
 import java.io.EOFException
 import java.io.IOException
+import java.net.Inet4Address
+import java.net.Inet6Address
+import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.Socket
 import java.security.MessageDigest
@@ -24,12 +27,13 @@ import java.util.concurrent.ConcurrentLinkedDeque
 import java.util.concurrent.atomic.AtomicBoolean
 import javax.net.ssl.HttpsURLConnection
 import javax.net.ssl.SNIHostName
+import javax.net.ssl.SSLContext
 import javax.net.ssl.SSLSocket
 import javax.net.ssl.SSLSocketFactory
 
 /**
  * High-speed, zero-compression RFC 6455 WebSocket connection over TLS SSLSocket
- * with explicit SNI (server_hostname) support for Cloudflare Clean IP routing.
+ * with explicit SNI (server_hostname) and shared TLS session cache for Cloudflare Clean IP routing.
  */
 class RawWebSocket(
     private val socket: Socket,
@@ -42,7 +46,9 @@ class RawWebSocket(
     val createdAtMs: Long = System.currentTimeMillis()
 
     companion object {
-        private val sharedRng = SecureRandom()
+        private val threadLocalRng = object : ThreadLocal<SecureRandom>() {
+            override fun initialValue(): SecureRandom = SecureRandom()
+        }
     }
 
     fun isClosed(): Boolean = closed.get() || socket.isClosed
@@ -52,14 +58,14 @@ class RawWebSocket(
     }
 
     /**
-     * Encrypts [plain] in-place with [xorKey] (if non-null) and RFC 6455 4-byte mask
-     * in a single tight pass, writing a binary frame directly to the TLS socket.
+     * Encrypts [plain] with [xorKey] (if non-null) and RFC 6455 4-byte mask
+     * in a single pass, writing a binary frame directly to the TLS socket.
      */
     fun sendBinary(plain: ByteArray, offset: Int = 0, length: Int = plain.size, xorKey: ByteArray? = null): Boolean {
         if (closed.get()) return false
         return try {
             val mask = ByteArray(4)
-            sharedRng.nextBytes(mask)
+            threadLocalRng.get()!!.nextBytes(mask)
 
             val headerSize = when {
                 length < 126 -> 2 + 4
@@ -91,14 +97,30 @@ class RawWebSocket(
             frame[p++] = mask[2]
             frame[p++] = mask[3]
 
+            val m0 = mask[0].toInt()
+            val m1 = mask[1].toInt()
+            val m2 = mask[2].toInt()
+            val m3 = mask[3].toInt()
             if (xorKey != null) {
                 for (i in 0 until length) {
-                    val enc = (plain[offset + i].toInt() xor xorKey[i and 15].toInt())
-                    frame[p + i] = (enc xor mask[i and 3].toInt()).toByte()
+                    val m = when (i and 3) {
+                        0 -> m0
+                        1 -> m1
+                        2 -> m2
+                        else -> m3
+                    }
+                    val enc = plain[offset + i].toInt() xor xorKey[i and 15].toInt()
+                    frame[p + i] = (enc xor m).toByte()
                 }
             } else {
                 for (i in 0 until length) {
-                    frame[p + i] = (plain[offset + i].toInt() xor mask[i and 3].toInt()).toByte()
+                    val m = when (i and 3) {
+                        0 -> m0
+                        1 -> m1
+                        2 -> m2
+                        else -> m3
+                    }
+                    frame[p + i] = (plain[offset + i].toInt() xor m).toByte()
                 }
             }
 
@@ -119,7 +141,7 @@ class RawWebSocket(
             if (closed.get()) return
             runCatching {
                 val mask = ByteArray(4)
-                sharedRng.nextBytes(mask)
+                threadLocalRng.get()!!.nextBytes(mask)
                 val len = payload.size.coerceAtMost(125)
                 val hdr = ByteArray(2 + 4 + len)
                 hdr[0] = (0x80 or opcode).toByte()
@@ -225,6 +247,8 @@ class WorkerTunnelSession(
     private val ws: RawWebSocket,
     val key: ByteArray,
 ) {
+    fun isClosed(): Boolean = ws.isClosed()
+
     fun sendPlain(data: ByteArray, offset: Int = 0, length: Int = data.size): Boolean {
         if (length <= WorkerDefaults.MAX_CHUNK) {
             return ws.sendBinary(data, offset, length, xorKey = key)
@@ -241,18 +265,22 @@ class WorkerTunnelSession(
     fun readPlain(): ByteArray? =
         ws.readMessage(xorKey = key)
 
+    fun setReadTimeout(timeoutMs: Int) {
+        ws.setReadTimeout(timeoutMs)
+    }
+
     fun close() {
         ws.close()
     }
 }
 
 /**
- * Maintains a small pool of pre-connected TLS+WebSocket connections so browser requests
- * execute in 1 RTT (with 0-RTT ClientHello inside buildInit) instead of waiting for TLS+WS setup.
+ * Maintains a small pool of fresh pre-connected TLS+WebSocket connections so browser requests
+ * execute rapidly without wasting battery or hitting Cloudflare idle limits.
  */
 object WorkerWsPool {
-    private const val POOL_SIZE = 4
-    private const val MAX_IDLE_AGE_MS = 12_000L
+    private const val POOL_SIZE = 2
+    private const val MAX_IDLE_AGE_MS = 6_000L
 
     private data class PoolConfig(
         val workerHost: String,
@@ -309,7 +337,7 @@ object WorkerWsPool {
                         }
                     }
                 }
-                withTimeoutOrNull(2500L) { refillSignal.receive() }
+                withTimeoutOrNull(3000L) { refillSignal.receive() }
             }
         }
     }
@@ -353,7 +381,23 @@ object WorkerWsPool {
 }
 
 object WorkerWsClient {
-    private val rng = SecureRandom()
+    private const val CONNECT_TIMEOUT_MS = 4500
+    private const val TLS_HANDSHAKE_TIMEOUT_MS = 5000
+    private const val POOLED_ACK_TIMEOUT_MS = 2200
+
+    private val sharedSslContext: SSLContext by lazy {
+        SSLContext.getInstance("TLS").apply {
+            init(null, null, null)
+            runCatching {
+                clientSessionContext.sessionCacheSize = 128
+                clientSessionContext.sessionTimeout = 600
+            }
+        }
+    }
+
+    private val threadLocalRng = object : ThreadLocal<SecureRandom>() {
+        override fun initialValue(): SecureRandom = SecureRandom()
+    }
 
     fun connectRawWebSocket(
         workerHost: String,
@@ -364,9 +408,11 @@ object WorkerWsClient {
         val host = workerHost.trim()
             .removePrefix("https://")
             .removePrefix("wss://")
-            .trimEnd('/')
+            .substringBefore('/')
+            .trim()
         val clean = cleanIp.trim().removePrefix("[").removeSuffix("]")
 
+        var firstError: Throwable? = null
         if (clean.isNotEmpty()) {
             val attempt = runCatching {
                 openTlsWebSocket(
@@ -377,14 +423,23 @@ object WorkerWsClient {
                 )
             }
             if (attempt.isSuccess) return attempt.getOrThrow()
+            firstError = attempt.exceptionOrNull()
         }
 
-        return openTlsWebSocket(
-            connectHost = host,
-            sniHost = host,
-            subproto = subproto,
-            socketProtector = socketProtector,
-        )
+        if (host.isEmpty()) {
+            throw firstError ?: IOException("آدرس سرور Worker خالی است.")
+        }
+
+        return try {
+            openTlsWebSocket(
+                connectHost = host,
+                sniHost = host,
+                subproto = subproto,
+                socketProtector = socketProtector,
+            )
+        } catch (t: Throwable) {
+            throw firstError ?: t
+        }
     }
 
     private fun openTlsWebSocket(
@@ -393,93 +448,119 @@ object WorkerWsClient {
         subproto: String,
         socketProtector: ((Socket) -> Boolean)?,
     ): RawWebSocket {
-        val rawSocket = Socket()
-        try {
-            val protector = socketProtector ?: VpnSocketProtector.activeProtector
-            if (protector != null && !protector.invoke(rawSocket)) {
-                throw IOException("امکان محافظت سوکت از مسیر VPN وجود ندارد.")
-            }
-            rawSocket.tcpNoDelay = true
-            rawSocket.keepAlive = true
-            runCatching {
-                rawSocket.receiveBufferSize = 512 * 1024
-                rawSocket.sendBufferSize = 512 * 1024
-            }
-            rawSocket.connect(
-                InetSocketAddress(connectHost, 443),
-                6000,
-            )
-
-            val factory = SSLSocketFactory.getDefault() as SSLSocketFactory
-            val sslSocket = factory.createSocket(rawSocket, sniHost, 443, true) as SSLSocket
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-                val params = sslSocket.sslParameters
-                params.serverNames = listOf(SNIHostName(sniHost))
-                params.endpointIdentificationAlgorithm = "HTTPS"
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                    params.applicationProtocols = arrayOf("http/1.1")
+        val candidates = resolvePreferIpv4(connectHost)
+        var lastError: Throwable? = null
+        for (addr in candidates) {
+            val rawSocket = Socket()
+            try {
+                if (!VpnSocketProtector.protectAndBind(rawSocket, socketProtector)) {
+                    throw IOException("امکان محافظت سوکت از مسیر VPN وجود ندارد.")
                 }
-                sslSocket.sslParameters = params
-            }
-            sslSocket.soTimeout = 8000
-            sslSocket.startHandshake()
+                rawSocket.tcpNoDelay = true
+                rawSocket.keepAlive = true
+                runCatching {
+                    rawSocket.receiveBufferSize = 1024 * 1024
+                    rawSocket.sendBufferSize = 1024 * 1024
+                    rawSocket.trafficClass = 0x10 // IPTOS_LOWDELAY
+                }
+                rawSocket.connect(InetSocketAddress(addr, 443), CONNECT_TIMEOUT_MS)
 
-            val verified = HttpsURLConnection.getDefaultHostnameVerifier()
-                .verify(sniHost, sslSocket.session)
-            if (!verified) {
-                throw IOException("تأیید گواهی SSL برای $sniHost ناموفق بود.")
-            }
+                val factory = sharedSslContext.socketFactory as SSLSocketFactory
+                val sslSocket = factory.createSocket(rawSocket, sniHost, 443, true) as SSLSocket
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                    val params = sslSocket.sslParameters
+                    params.serverNames = listOf(SNIHostName(sniHost))
+                    params.endpointIdentificationAlgorithm = "HTTPS"
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                        params.applicationProtocols = arrayOf("http/1.1")
+                    }
+                    sslSocket.sslParameters = params
+                }
+                sslSocket.soTimeout = TLS_HANDSHAKE_TIMEOUT_MS
+                sslSocket.startHandshake()
 
-            // RFC 6455 HTTP/1.1 Upgrade
-            val nonceBytes = ByteArray(16).also { rng.nextBytes(it) }
-            val wsKey = encodeBase64(nonceBytes)
-            val sb = StringBuilder()
-            sb.append("GET / HTTP/1.1\r\n")
-            sb.append("Host: ").append(sniHost).append("\r\n")
-            sb.append("Upgrade: websocket\r\n")
-            sb.append("Connection: Upgrade\r\n")
-            sb.append("Sec-WebSocket-Key: ").append(wsKey).append("\r\n")
-            sb.append("Sec-WebSocket-Version: 13\r\n")
-            if (subproto.isNotBlank()) {
-                sb.append("Sec-WebSocket-Protocol: ").append(subproto.trim()).append("\r\n")
-            }
-            sb.append("User-Agent: CloudNG/1.0\r\n")
-            sb.append("\r\n")
+                val verified = HttpsURLConnection.getDefaultHostnameVerifier()
+                    .verify(sniHost, sslSocket.session)
+                if (!verified) {
+                    throw IOException("تأیید گواهی SSL برای $sniHost ناموفق بود.")
+                }
 
-            val out = sslSocket.getOutputStream()
-            out.write(sb.toString().toByteArray(Charsets.US_ASCII))
-            out.flush()
+                // RFC 6455 HTTP/1.1 Upgrade
+                val nonceBytes = ByteArray(16).also { threadLocalRng.get()!!.nextBytes(it) }
+                val wsKey = encodeBase64(nonceBytes)
+                val sb = StringBuilder(256)
+                sb.append("GET / HTTP/1.1\r\n")
+                sb.append("Host: ").append(sniHost).append("\r\n")
+                sb.append("Upgrade: websocket\r\n")
+                sb.append("Connection: Upgrade\r\n")
+                sb.append("Sec-WebSocket-Key: ").append(wsKey).append("\r\n")
+                sb.append("Sec-WebSocket-Version: 13\r\n")
+                if (subproto.isNotBlank()) {
+                    sb.append("Sec-WebSocket-Protocol: ").append(subproto.trim()).append("\r\n")
+                }
+                sb.append("User-Agent: CloudNG/1.0\r\n")
+                sb.append("\r\n")
 
-            val inStream = BufferedInputStream(sslSocket.getInputStream(), 65536)
-            val statusLine = readHeaderLine(inStream)
-                ?: throw IOException("پاسخ ارتقا WebSocket از سرور دریافت نشد.")
-            if (!statusLine.contains("101")) {
-                throw IOException("ارتقا به WebSocket رد شد: $statusLine")
-            }
-            var acceptOk = false
-            val expectedAccept = computeAcceptKey(wsKey)
-            while (true) {
-                val line = readHeaderLine(inStream) ?: break
-                if (line.isEmpty()) break
-                val colon = line.indexOf(':')
-                if (colon > 0) {
-                    val name = line.substring(0, colon).trim()
-                    val value = line.substring(colon + 1).trim()
-                    if (name.equals("Sec-WebSocket-Accept", ignoreCase = true) && value == expectedAccept) {
-                        acceptOk = true
+                val out = sslSocket.getOutputStream()
+                out.write(sb.toString().toByteArray(Charsets.US_ASCII))
+                out.flush()
+
+                val inStream = BufferedInputStream(sslSocket.getInputStream(), 65536)
+                val statusLine = readHeaderLine(inStream)
+                    ?: throw IOException("پاسخ ارتقا WebSocket از سرور دریافت نشد.")
+                if (!statusLine.contains("101")) {
+                    throw IOException("ارتقا به WebSocket رد شد: $statusLine")
+                }
+                var acceptOk = false
+                val expectedAccept = computeAcceptKey(wsKey)
+                while (true) {
+                    val line = readHeaderLine(inStream) ?: break
+                    if (line.isEmpty()) break
+                    val colon = line.indexOf(':')
+                    if (colon > 0) {
+                        val name = line.substring(0, colon).trim()
+                        val value = line.substring(colon + 1).trim()
+                        if (name.equals("Sec-WebSocket-Accept", ignoreCase = true) && value == expectedAccept) {
+                            acceptOk = true
+                        }
                     }
                 }
-            }
-            if (!acceptOk) {
-                throw IOException("کلید Sec-WebSocket-Accept نامعتبر است.")
-            }
+                if (!acceptOk) {
+                    throw IOException("کلید Sec-WebSocket-Accept نامعتبر است.")
+                }
 
-            sslSocket.soTimeout = 0
-            return RawWebSocket(sslSocket, preBufferedInput = inStream)
-        } catch (t: Throwable) {
-            runCatching { rawSocket.close() }
-            throw t
+                sslSocket.soTimeout = 0
+                return RawWebSocket(sslSocket, preBufferedInput = inStream)
+            } catch (t: Throwable) {
+                lastError = t
+                runCatching { rawSocket.close() }
+            }
         }
+        throw lastError ?: IOException("اتصال به $connectHost:443 ناموفق بود.")
+    }
+
+    private fun resolvePreferIpv4(host: String): List<InetAddress> {
+        val clean = host.trim().removePrefix("[").removeSuffix("]")
+        val literal = parseLiteralIp(clean)
+        if (literal != null) return listOf(literal)
+        val all = InetAddress.getAllByName(clean).toList()
+        if (all.size <= 1) return all
+        val v4 = all.filterIsInstance<Inet4Address>()
+        val v6 = all.filterIsInstance<Inet6Address>()
+        return (v4 + v6).take(3)
+    }
+
+    private fun parseLiteralIp(host: String): InetAddress? {
+        if (host.matches(Regex("^\\d{1,3}(\\.\\d{1,3}){3}$"))) {
+            val parts = host.split(".").mapNotNull { it.toIntOrNull() }
+            if (parts.size == 4 && parts.all { it in 0..255 }) {
+                return InetAddress.getByAddress(parts.map { it.toByte() }.toByteArray())
+            }
+        }
+        if (host.contains(":")) {
+            return runCatching { InetAddress.getByName(host) }.getOrNull()
+        }
+        return null
     }
 
     fun openTunnel(
@@ -492,26 +573,34 @@ object WorkerWsClient {
         initialPayload: ByteArray = ByteArray(0),
         socketProtector: ((Socket) -> Boolean)? = null,
     ): WorkerTunnelSession {
-        var ws = WorkerWsPool.acquire(workerHost, cleanIp, subproto)
-        var fromPool = ws != null
-        if (ws == null) {
-            ws = connectRawWebSocket(workerHost, cleanIp, subproto, socketProtector)
+        val pooledWs = WorkerWsPool.acquire(workerHost, cleanIp, subproto)
+        if (pooledWs != null) {
+            try {
+                return performHandshake(
+                    ws = pooledWs,
+                    uuid = uuid,
+                    targetHost = targetHost,
+                    targetPort = targetPort,
+                    initialPayload = initialPayload,
+                    ackTimeoutMs = POOLED_ACK_TIMEOUT_MS,
+                )
+            } catch (_: Throwable) {
+                pooledWs.close()
+            }
         }
 
-        try {
-            return performHandshake(ws, uuid, targetHost, targetPort, initialPayload)
+        val fresh = connectRawWebSocket(workerHost, cleanIp, subproto, socketProtector)
+        return try {
+            performHandshake(
+                ws = fresh,
+                uuid = uuid,
+                targetHost = targetHost,
+                targetPort = targetPort,
+                initialPayload = initialPayload,
+                ackTimeoutMs = WorkerDefaults.ACK_TIMEOUT_MS.toInt(),
+            )
         } catch (t: Throwable) {
-            ws.close()
-            if (fromPool) {
-                // Retry once with a fresh connection in case the pooled socket was closed by peer
-                val fresh = connectRawWebSocket(workerHost, cleanIp, subproto, socketProtector)
-                return try {
-                    performHandshake(fresh, uuid, targetHost, targetPort, initialPayload)
-                } catch (t2: Throwable) {
-                    fresh.close()
-                    throw t2
-                }
-            }
+            fresh.close()
             throw t
         }
     }
@@ -522,9 +611,10 @@ object WorkerWsClient {
         targetHost: String,
         targetPort: Int,
         initialPayload: ByteArray,
+        ackTimeoutMs: Int,
     ): WorkerTunnelSession {
         val init = WorkerCrypto.buildInit(uuid, targetHost, targetPort, initialPayload)
-        ws.setReadTimeout(WorkerDefaults.ACK_TIMEOUT_MS.toInt())
+        ws.setReadTimeout(ackTimeoutMs)
         if (!ws.sendBinary(init.data, xorKey = null)) {
             throw IOException("ارسال بسته اولیه به سرور Worker ناموفق بود.")
         }
