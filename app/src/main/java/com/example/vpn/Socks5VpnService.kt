@@ -10,6 +10,7 @@ import android.content.pm.ServiceInfo
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
@@ -51,6 +52,7 @@ class Socks5VpnService : VpnService() {
     private var vpnInterface: ParcelFileDescriptor? = null
     private var packetEngine: TunPacketEngine? = null
     private var localSocks5Server: LocalSocks5Server? = null
+    private var networkCallback: ConnectivityManager.NetworkCallback? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
@@ -125,6 +127,7 @@ class Socks5VpnService : VpnService() {
                 val vpnProtector: (java.net.Socket) -> Boolean = { sock -> protect(sock) }
                 VpnSocketProtector.activeProtector = vpnProtector
                 VpnSocketProtector.underlyingNetwork = physicalNetwork
+                registerUnderlyingNetworkCallback()
 
                 val pfd = establishVpnInterface(
                     profile = profile,
@@ -277,6 +280,54 @@ class Socks5VpnService : VpnService() {
         }.getOrNull()
     }
 
+    private fun registerUnderlyingNetworkCallback() {
+        unregisterUnderlyingNetworkCallback()
+        runCatching {
+            val cm = getSystemService(ConnectivityManager::class.java) ?: return
+            val request = NetworkRequest.Builder()
+                .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                .addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
+                .build()
+            val cb = object : ConnectivityManager.NetworkCallback() {
+                override fun onAvailable(network: Network) {
+                    updateUnderlyingPhysicalNetwork(network)
+                }
+
+                override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) {
+                    if (!caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) {
+                        updateUnderlyingPhysicalNetwork(network)
+                    }
+                }
+
+                override fun onLost(network: Network) {
+                    if (VpnSocketProtector.underlyingNetwork == network) {
+                        val fallback = findUnderlyingPhysicalNetwork()
+                        updateUnderlyingPhysicalNetwork(fallback)
+                    }
+                }
+            }
+            cm.registerNetworkCallback(request, cb)
+            networkCallback = cb
+        }
+    }
+
+    private fun updateUnderlyingPhysicalNetwork(network: Network?) {
+        VpnSocketProtector.underlyingNetwork = network
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP_MR1 && vpnInterface != null) {
+            runCatching {
+                setUnderlyingNetworks(if (network != null) arrayOf(network) else null)
+            }
+        }
+    }
+
+    private fun unregisterUnderlyingNetworkCallback() {
+        val cb = networkCallback ?: return
+        networkCallback = null
+        runCatching {
+            getSystemService(ConnectivityManager::class.java)?.unregisterNetworkCallback(cb)
+        }
+    }
+
     private fun establishVpnInterface(
         profile: ProxyProfile,
         dnsServer: String,
@@ -301,14 +352,15 @@ class Socks5VpnService : VpnService() {
 
         when (perAppMode) {
             PerAppMode.ALL_APPS -> {
-                val selfBypassed = runCatching { builder.addDisallowedApplication(selfPkg) }.isSuccess
-                if (!selfBypassed) {
-                    runCatching { builder.addDisallowedApplication(packageName) }
-                }
+                val selfBypassed = runCatching { builder.addDisallowedApplication(selfPkg) }.isSuccess ||
+                    runCatching { builder.addDisallowedApplication(packageName) }.isSuccess
+                VpnSocketProtector.selfUidBypassed = selfBypassed
                 VpnStateManager.addLog(LogLevel.INFO, "BYPASS", "خود برنامه ($selfPkg) از تونل Bypass شد.")
             }
             PerAppMode.BYPASS_SELECTED -> {
-                runCatching { builder.addDisallowedApplication(selfPkg) }
+                val selfBypassed = runCatching { builder.addDisallowedApplication(selfPkg) }.isSuccess ||
+                    runCatching { builder.addDisallowedApplication(packageName) }.isSuccess
+                VpnSocketProtector.selfUidBypassed = selfBypassed
                 var extraCount = 0
                 for (pkg in perAppPackages) {
                     val cleanPkg = pkg.trim()
@@ -327,7 +379,7 @@ class Socks5VpnService : VpnService() {
             PerAppMode.PROXY_SELECTED -> {
                 val allowedApps = perAppPackages
                     .map { it.trim() }
-                    .filter { it.isNotEmpty() && it != selfPkg }
+                    .filter { it.isNotEmpty() && it != selfPkg && it != packageName }
                     .distinct()
                 var addedCount = 0
                 for (pkg in allowedApps) {
@@ -336,13 +388,17 @@ class Socks5VpnService : VpnService() {
                     }
                 }
                 if (addedCount == 0) {
-                    runCatching { builder.addDisallowedApplication(selfPkg) }
+                    val selfBypassed = runCatching { builder.addDisallowedApplication(selfPkg) }.isSuccess ||
+                        runCatching { builder.addDisallowedApplication(packageName) }.isSuccess
+                    VpnSocketProtector.selfUidBypassed = selfBypassed
                     VpnStateManager.addLog(
                         LogLevel.WARNING,
                         "BYPASS",
                         "هیچ برنامه‌ای برای تونل انتخاب نشد؛ خود برنامه ($selfPkg) Bypass شد.",
                     )
                 } else {
+                    // Only allowlisted apps enter TUN, so CloudNG's own UID is inherently bypassed
+                    VpnSocketProtector.selfUidBypassed = true
                     VpnStateManager.addLog(
                         LogLevel.INFO,
                         "PER-APP",
@@ -378,8 +434,10 @@ class Socks5VpnService : VpnService() {
     }
 
     private fun stopTunnelResources() {
+        unregisterUnderlyingNetworkCallback()
         VpnSocketProtector.activeProtector = null
         VpnSocketProtector.underlyingNetwork = null
+        VpnSocketProtector.selfUidBypassed = false
         statsJob?.cancel()
         statsJob = null
         tunnelJob?.cancel()

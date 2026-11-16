@@ -453,15 +453,15 @@ object WorkerWsClient {
         for (addr in candidates) {
             val rawSocket = Socket()
             try {
-                if (!VpnSocketProtector.protectAndBind(rawSocket, socketProtector)) {
-                    throw IOException("امکان محافظت سوکت از مسیر VPN وجود ندارد.")
-                }
                 rawSocket.tcpNoDelay = true
                 rawSocket.keepAlive = true
                 runCatching {
                     rawSocket.receiveBufferSize = 1024 * 1024
                     rawSocket.sendBufferSize = 1024 * 1024
                     rawSocket.trafficClass = 0x10 // IPTOS_LOWDELAY
+                }
+                if (!VpnSocketProtector.protectAndBind(rawSocket, socketProtector, addr)) {
+                    throw IOException("امکان محافظت سوکت از مسیر VPN وجود ندارد.")
                 }
                 rawSocket.connect(InetSocketAddress(addr, 443), CONNECT_TIMEOUT_MS)
 

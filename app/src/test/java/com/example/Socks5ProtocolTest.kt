@@ -468,5 +468,60 @@ class Socks5ProtocolTest {
         assertEquals(6, (outBytes[udpTotal].toInt() ushr 4) and 0x0F)
         assertEquals(0x14, outBytes[udpTotal + 53].toInt() and 0xFF)
     }
+
+    @Test
+    fun `vpn socket protector binds socket fd before protect callback and honors selfUidBypassed`() {
+        val v4Target = InetAddress.getByName("127.0.0.1")
+        try {
+            com.example.vpn.VpnSocketProtector.activeProtector = null
+            com.example.vpn.VpnSocketProtector.underlyingNetwork = null
+            com.example.vpn.VpnSocketProtector.selfUidBypassed = false
+
+            // 1. Socket must already be bound (native FD allocated) before protector runs
+            java.net.Socket().use { sock1 ->
+                assertFalse(sock1.isBound)
+                var wasBoundWhenProtectCalled = false
+                var localPortWhenProtectCalled = -1
+                val ok = com.example.vpn.VpnSocketProtector.protectAndBind(
+                    socket = sock1,
+                    explicitProtector = { s ->
+                        wasBoundWhenProtectCalled = s.isBound
+                        localPortWhenProtectCalled = s.localPort
+                        true
+                    },
+                    targetAddress = v4Target,
+                )
+                assertTrue(ok)
+                assertTrue(wasBoundWhenProtectCalled)
+                assertTrue(localPortWhenProtectCalled > 0)
+            }
+
+            // 2. When protector returns false and selfUidBypassed == false, protectAndBind returns false
+            java.net.Socket().use { sock2 ->
+                val rejected = com.example.vpn.VpnSocketProtector.protectAndBind(
+                    socket = sock2,
+                    explicitProtector = { false },
+                    targetAddress = v4Target,
+                )
+                assertFalse(rejected)
+            }
+
+            // 3. When protector returns false but selfUidBypassed == true, protectAndBind succeeds
+            com.example.vpn.VpnSocketProtector.selfUidBypassed = true
+            java.net.Socket().use { sock3 ->
+                val bypassedOk = com.example.vpn.VpnSocketProtector.protectAndBind(
+                    socket = sock3,
+                    explicitProtector = { false },
+                    targetAddress = v4Target,
+                )
+                assertTrue(bypassedOk)
+            }
+        } finally {
+            com.example.vpn.VpnSocketProtector.activeProtector = null
+            com.example.vpn.VpnSocketProtector.underlyingNetwork = null
+            com.example.vpn.VpnSocketProtector.selfUidBypassed = false
+        }
+    }
 }
+
 
