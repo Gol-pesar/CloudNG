@@ -122,7 +122,7 @@ fun ActivitySettingsScreen(
                 Surface(
                     shape = MaterialTheme.shapes.medium,
                     color = MaterialTheme.colorScheme.surface,
-                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.4f)),
+                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.30f)),
                     modifier = Modifier
                         .widthIn(max = 640.dp)
                         .fillMaxWidth(),
@@ -252,6 +252,7 @@ fun ActivitySettingsScreen(
                     Surface(
                         shape = MaterialTheme.shapes.medium,
                         color = MaterialTheme.colorScheme.surface,
+                        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.28f)),
                         modifier = Modifier
                             .widthIn(max = 640.dp)
                             .fillMaxWidth(),
@@ -330,7 +331,7 @@ fun ActivitySettingsScreen(
                     Surface(
                         shape = MaterialTheme.shapes.medium,
                         color = MaterialTheme.colorScheme.surface,
-                        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.4f)),
+                        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.30f)),
                     ) {
                         Column(
                             modifier = Modifier.padding(16.dp),
@@ -394,7 +395,7 @@ fun ActivitySettingsScreen(
                     Surface(
                         shape = MaterialTheme.shapes.medium,
                         color = MaterialTheme.colorScheme.surface,
-                        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.4f)),
+                        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.30f)),
                     ) {
                         Column(
                             modifier = Modifier.padding(16.dp),
@@ -428,6 +429,11 @@ fun ActivitySettingsScreen(
                                 )
                             }
 
+                            androidx.compose.material3.HorizontalDivider(
+                                thickness = 1.dp,
+                                color = MaterialTheme.colorScheme.outline.copy(alpha = 0.20f),
+                            )
+
                             Row(
                                 modifier = Modifier.fillMaxWidth(),
                                 horizontalArrangement = Arrangement.SpaceBetween,
@@ -454,7 +460,7 @@ fun ActivitySettingsScreen(
                     Surface(
                         shape = MaterialTheme.shapes.medium,
                         color = MaterialTheme.colorScheme.surface,
-                        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.4f)),
+                        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.30f)),
                     ) {
                         Column(
                             modifier = Modifier.padding(16.dp),
@@ -496,7 +502,7 @@ fun ActivitySettingsScreen(
                     Surface(
                         shape = MaterialTheme.shapes.medium,
                         color = MaterialTheme.colorScheme.surface,
-                        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.4f)),
+                        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.30f)),
                     ) {
                         Column(
                             modifier = Modifier.padding(16.dp),

@@ -265,16 +265,16 @@ private fun ServerProfileCard(
     modifier: Modifier = Modifier,
 ) {
     val borderColor = if (isSelected) {
-        MaterialTheme.colorScheme.primary
+        MaterialTheme.colorScheme.primary.copy(alpha = 0.75f)
     } else {
-        MaterialTheme.colorScheme.outline.copy(alpha = 0.45f)
+        MaterialTheme.colorScheme.outline.copy(alpha = 0.30f)
     }
 
     Surface(
         onClick = onSelect,
         shape = MaterialTheme.shapes.medium,
         color = if (isSelected) {
-            MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.25f)
+            MaterialTheme.colorScheme.primary.copy(alpha = 0.08f)
         } else {
             MaterialTheme.colorScheme.surface
         },
@@ -284,8 +284,8 @@ private fun ServerProfileCard(
             .testTag("server_card_${profile.id}"),
     ) {
         Column(
-            modifier = Modifier.padding(14.dp),
-            verticalArrangement = Arrangement.spacedBy(10.dp),
+            modifier = Modifier.padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
             Row(
                 modifier = Modifier.fillMaxWidth(),
@@ -294,7 +294,7 @@ private fun ServerProfileCard(
             ) {
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    horizontalArrangement = Arrangement.spacedBy(12.dp),
                     modifier = Modifier.weight(1f),
                 ) {
                     Icon(
@@ -379,7 +379,7 @@ private fun ServerProfileCard(
                         Icon(
                             Icons.Filled.QrCode2,
                             contentDescription = stringResource(R.string.action_show_qr),
-                            tint = MaterialTheme.colorScheme.secondary,
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
                     }
                     IconButton(
@@ -415,7 +415,7 @@ private fun ServerProfileCard(
                         Icon(
                             Icons.Filled.DeleteOutline,
                             contentDescription = stringResource(R.string.action_delete),
-                            tint = MaterialTheme.colorScheme.error,
+                            tint = MaterialTheme.colorScheme.error.copy(alpha = 0.85f),
                         )
                     }
                 }
@@ -431,7 +431,8 @@ private fun TagChip(
 ) {
     Surface(
         shape = RoundedCornerShape(8.dp),
-        color = MaterialTheme.colorScheme.surfaceVariant,
+        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.72f),
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.22f)),
     ) {
         CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Ltr) {
             Row(

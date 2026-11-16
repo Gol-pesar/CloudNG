@@ -105,15 +105,17 @@ fun ConnectScreen(
                     onToggleConnection = onToggleConnection,
                 )
 
+                val cardBorder = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.30f))
+
                 // Operation Mode Switcher: Full System VPN vs Local SOCKS5 (127.0.0.1:40446)
                 Surface(
                     shape = MaterialTheme.shapes.medium,
                     color = MaterialTheme.colorScheme.surface,
-                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.4f)),
+                    border = cardBorder,
                     modifier = Modifier.fillMaxWidth(),
                 ) {
                     Column(
-                        modifier = Modifier.padding(14.dp),
+                        modifier = Modifier.padding(16.dp),
                         verticalArrangement = Arrangement.spacedBy(10.dp),
                     ) {
                         Row(
@@ -140,12 +142,13 @@ fun ConnectScreen(
                                             )
                                             onShowMessage("آدرس پروکسی محلی کپی شد.")
                                         },
-                                        modifier = Modifier.size(32.dp),
+                                        modifier = Modifier.size(36.dp),
                                     ) {
                                         Icon(
                                             Icons.Filled.ContentCopy,
                                             contentDescription = "کپی آدرس پروکسی محلی",
                                             modifier = Modifier.size(15.dp),
+                                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
                                         )
                                     }
                                 }
@@ -184,7 +187,7 @@ fun ConnectScreen(
                     onClick = if (selected != null) onOpenServersTab else onOpenAddServer,
                     shape = MaterialTheme.shapes.medium,
                     color = MaterialTheme.colorScheme.surface,
-                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.45f)),
+                    border = cardBorder,
                     modifier = Modifier
                         .fillMaxWidth()
                         .testTag("active_server_selector_card"),
@@ -203,14 +206,19 @@ fun ConnectScreen(
                         ) {
                             Surface(
                                 shape = RoundedCornerShape(12.dp),
-                                color = MaterialTheme.colorScheme.primaryContainer,
-                                modifier = Modifier.size(44.dp),
+                                color = MaterialTheme.colorScheme.primary.copy(alpha = 0.12f),
+                                border = BorderStroke(
+                                    1.dp,
+                                    MaterialTheme.colorScheme.primary.copy(alpha = 0.28f),
+                                ),
+                                modifier = Modifier.size(42.dp),
                             ) {
                                 Box(contentAlignment = Alignment.Center) {
                                     Icon(
                                         imageVector = if (selected != null) Icons.Filled.Dns else Icons.Filled.Add,
                                         contentDescription = null,
-                                        tint = MaterialTheme.colorScheme.onPrimaryContainer,
+                                        tint = MaterialTheme.colorScheme.primary,
+                                        modifier = Modifier.size(20.dp),
                                     )
                                 }
                             }
@@ -268,7 +276,7 @@ fun ConnectScreen(
                     onClick = onOpenPerAppProxy,
                     shape = MaterialTheme.shapes.medium,
                     color = MaterialTheme.colorScheme.surface,
-                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.4f)),
+                    border = cardBorder,
                     modifier = Modifier
                         .fillMaxWidth()
                         .testTag("dashboard_per_app_card"),
@@ -276,7 +284,7 @@ fun ConnectScreen(
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .padding(horizontal = 16.dp, vertical = 12.dp),
+                            .padding(horizontal = 16.dp, vertical = 14.dp),
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.SpaceBetween,
                     ) {
@@ -287,14 +295,19 @@ fun ConnectScreen(
                         ) {
                             Surface(
                                 shape = RoundedCornerShape(12.dp),
-                                color = MaterialTheme.colorScheme.secondaryContainer,
-                                modifier = Modifier.size(40.dp),
+                                color = MaterialTheme.colorScheme.secondary.copy(alpha = 0.12f),
+                                border = BorderStroke(
+                                    1.dp,
+                                    MaterialTheme.colorScheme.secondary.copy(alpha = 0.28f),
+                                ),
+                                modifier = Modifier.size(42.dp),
                             ) {
                                 Box(contentAlignment = Alignment.Center) {
                                     Icon(
                                         imageVector = Icons.Filled.Apps,
                                         contentDescription = null,
-                                        tint = MaterialTheme.colorScheme.onSecondaryContainer,
+                                        tint = MaterialTheme.colorScheme.secondary,
+                                        modifier = Modifier.size(20.dp),
                                     )
                                 }
                             }
@@ -329,7 +342,7 @@ fun ConnectScreen(
                 Surface(
                     shape = MaterialTheme.shapes.medium,
                     color = MaterialTheme.colorScheme.surface,
-                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.4f)),
+                    border = cardBorder,
                     modifier = Modifier.fillMaxWidth(),
                 ) {
                     Column(
@@ -353,11 +366,17 @@ fun ConnectScreen(
                                 )
                                 Text("نمودار ترافیک زنده", style = MaterialTheme.typography.titleMedium)
                             }
-                            Text(
-                                text = "${telemetry.activeConnectionCount} اتصال فعال",
-                                style = MaterialTheme.typography.labelMedium,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            )
+                            Surface(
+                                shape = MaterialTheme.shapes.small,
+                                color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.7f),
+                            ) {
+                                Text(
+                                    text = "${telemetry.activeConnectionCount} اتصال فعال",
+                                    style = MaterialTheme.typography.labelMedium,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp),
+                                )
+                            }
                         }
 
                         Row(
@@ -396,7 +415,7 @@ fun ConnectScreen(
                     Surface(
                         shape = MaterialTheme.shapes.medium,
                         color = MaterialTheme.colorScheme.surface,
-                        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.4f)),
+                        border = cardBorder,
                         modifier = Modifier.fillMaxWidth(),
                     ) {
                         Column(
@@ -492,7 +511,8 @@ private fun TrafficMetricBox(
 ) {
     Surface(
         shape = MaterialTheme.shapes.small,
-        color = MaterialTheme.colorScheme.surfaceVariant,
+        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.72f),
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.22f)),
         modifier = modifier,
     ) {
         Column(
@@ -543,7 +563,8 @@ private fun InfoPillBox(
 ) {
     Surface(
         shape = MaterialTheme.shapes.small,
-        color = MaterialTheme.colorScheme.surfaceVariant,
+        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.72f),
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.22f)),
         modifier = modifier,
     ) {
         Column(

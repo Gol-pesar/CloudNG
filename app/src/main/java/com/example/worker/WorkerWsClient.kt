@@ -279,8 +279,8 @@ class WorkerTunnelSession(
  * execute rapidly without wasting battery or hitting Cloudflare idle limits.
  */
 object WorkerWsPool {
-    private const val POOL_SIZE = 2
-    private const val MAX_IDLE_AGE_MS = 6_000L
+    private const val POOL_SIZE = 4
+    private const val MAX_IDLE_AGE_MS = 9_000L
 
     private data class PoolConfig(
         val workerHost: String,
@@ -381,9 +381,9 @@ object WorkerWsPool {
 }
 
 object WorkerWsClient {
-    private const val CONNECT_TIMEOUT_MS = 4500
-    private const val TLS_HANDSHAKE_TIMEOUT_MS = 5000
-    private const val POOLED_ACK_TIMEOUT_MS = 2200
+    private const val CONNECT_TIMEOUT_MS = 8000
+    private const val TLS_HANDSHAKE_TIMEOUT_MS = 8000
+    private const val POOLED_ACK_TIMEOUT_MS = 16000
 
     private val sharedSslContext: SSLContext by lazy {
         SSLContext.getInstance("TLS").apply {
@@ -395,8 +395,61 @@ object WorkerWsClient {
         }
     }
 
+    fun getSharedSslSocketFactory(): SSLSocketFactory =
+        sharedSslContext.socketFactory as SSLSocketFactory
+
     private val threadLocalRng = object : ThreadLocal<SecureRandom>() {
         override fun initialValue(): SecureRandom = SecureRandom()
+    }
+
+    private data class ParsedWorkerEndpoint(
+        val host: String,
+        val port: Int,
+        val path: String,
+    )
+
+    private fun parseWorkerEndpoint(raw: String): ParsedWorkerEndpoint {
+        var s = raw.trim()
+            .removePrefix("https://")
+            .removePrefix("wss://")
+            .removePrefix("http://")
+            .removePrefix("ws://")
+            .trim()
+        val slashIdx = s.indexOf('/')
+        val path = if (slashIdx >= 0) {
+            val rawPath = s.substring(slashIdx).trim()
+            s = s.substring(0, slashIdx)
+            if (rawPath.startsWith("/")) rawPath else "/$rawPath"
+        } else {
+            "/"
+        }
+        val (host, port) = parseHostAndPort(s, defaultPort = 443)
+        return ParsedWorkerEndpoint(host = host, port = port, path = path)
+    }
+
+    private fun parseHostAndPort(raw: String, defaultPort: Int): Pair<String, Int> {
+        val clean = raw.trim()
+        if (clean.startsWith("[")) {
+            val closeIdx = clean.indexOf(']')
+            if (closeIdx > 0) {
+                val h = clean.substring(1, closeIdx)
+                val rest = clean.substring(closeIdx + 1)
+                val p = if (rest.startsWith(":")) {
+                    rest.substring(1).toIntOrNull()?.takeIf { it in 1..65535 } ?: defaultPort
+                } else {
+                    defaultPort
+                }
+                return h to p
+            }
+        }
+        val colonIdx = clean.lastIndexOf(':')
+        if (colonIdx > 0 && clean.indexOf(':') == colonIdx) {
+            val possiblePort = clean.substring(colonIdx + 1).toIntOrNull()
+            if (possiblePort != null && possiblePort in 1..65535) {
+                return clean.substring(0, colonIdx).trim() to possiblePort
+            }
+        }
+        return clean.removePrefix("[").removeSuffix("]") to defaultPort
     }
 
     fun connectRawWebSocket(
@@ -405,35 +458,42 @@ object WorkerWsClient {
         subproto: String,
         socketProtector: ((Socket) -> Boolean)? = null,
     ): RawWebSocket {
-        val host = workerHost.trim()
-            .removePrefix("https://")
-            .removePrefix("wss://")
-            .substringBefore('/')
-            .trim()
-        val clean = cleanIp.trim().removePrefix("[").removeSuffix("]")
+        val endpoint = parseWorkerEndpoint(workerHost)
+        val cleanCandidates = cleanIp
+            .split(',', ';', '\n', ' ')
+            .map { it.trim() }
+            .filter { it.isNotEmpty() }
 
         var firstError: Throwable? = null
-        if (clean.isNotEmpty()) {
+        for (rawCandidate in cleanCandidates) {
+            val (connectHost, connectPort) = parseHostAndPort(rawCandidate, endpoint.port)
+            if (connectHost.isEmpty()) continue
             val attempt = runCatching {
                 openTlsWebSocket(
-                    connectHost = clean,
-                    sniHost = host,
+                    connectHost = connectHost,
+                    connectPort = connectPort,
+                    sniHost = endpoint.host,
+                    wsPath = endpoint.path,
                     subproto = subproto,
                     socketProtector = socketProtector,
                 )
             }
             if (attempt.isSuccess) return attempt.getOrThrow()
-            firstError = attempt.exceptionOrNull()
+            if (firstError == null) {
+                firstError = attempt.exceptionOrNull()
+            }
         }
 
-        if (host.isEmpty()) {
+        if (endpoint.host.isEmpty()) {
             throw firstError ?: IOException("آدرس سرور Worker خالی است.")
         }
 
         return try {
             openTlsWebSocket(
-                connectHost = host,
-                sniHost = host,
+                connectHost = endpoint.host,
+                connectPort = endpoint.port,
+                sniHost = endpoint.host,
+                wsPath = endpoint.path,
                 subproto = subproto,
                 socketProtector = socketProtector,
             )
@@ -444,7 +504,9 @@ object WorkerWsClient {
 
     private fun openTlsWebSocket(
         connectHost: String,
+        connectPort: Int,
         sniHost: String,
+        wsPath: String,
         subproto: String,
         socketProtector: ((Socket) -> Boolean)?,
     ): RawWebSocket {
@@ -463,10 +525,10 @@ object WorkerWsClient {
                 if (!VpnSocketProtector.protectAndBind(rawSocket, socketProtector, addr)) {
                     throw IOException("امکان محافظت سوکت از مسیر VPN وجود ندارد.")
                 }
-                rawSocket.connect(InetSocketAddress(addr, 443), CONNECT_TIMEOUT_MS)
+                rawSocket.connect(InetSocketAddress(addr, connectPort), CONNECT_TIMEOUT_MS)
 
                 val factory = sharedSslContext.socketFactory as SSLSocketFactory
-                val sslSocket = factory.createSocket(rawSocket, sniHost, 443, true) as SSLSocket
+                val sslSocket = factory.createSocket(rawSocket, sniHost, connectPort, true) as SSLSocket
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
                     val params = sslSocket.sslParameters
                     params.serverNames = listOf(SNIHostName(sniHost))
@@ -488,9 +550,10 @@ object WorkerWsClient {
                 // RFC 6455 HTTP/1.1 Upgrade
                 val nonceBytes = ByteArray(16).also { threadLocalRng.get()!!.nextBytes(it) }
                 val wsKey = encodeBase64(nonceBytes)
+                val hostHeader = if (connectPort == 443) sniHost else "$sniHost:$connectPort"
                 val sb = StringBuilder(256)
-                sb.append("GET / HTTP/1.1\r\n")
-                sb.append("Host: ").append(sniHost).append("\r\n")
+                sb.append("GET ").append(wsPath).append(" HTTP/1.1\r\n")
+                sb.append("Host: ").append(hostHeader).append("\r\n")
                 sb.append("Upgrade: websocket\r\n")
                 sb.append("Connection: Upgrade\r\n")
                 sb.append("Sec-WebSocket-Key: ").append(wsKey).append("\r\n")
@@ -536,7 +599,7 @@ object WorkerWsClient {
                 runCatching { rawSocket.close() }
             }
         }
-        throw lastError ?: IOException("اتصال به $connectHost:443 ناموفق بود.")
+        throw lastError ?: IOException("اتصال به $connectHost:$connectPort ناموفق بود.")
     }
 
     private fun resolvePreferIpv4(host: String): List<InetAddress> {

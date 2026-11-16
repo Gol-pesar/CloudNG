@@ -204,66 +204,98 @@ fun SocksGuardApp(
     CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Rtl) {
         BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
             val useRail = maxWidth >= 600.dp
+            val hairlineColor = MaterialTheme.colorScheme.outline.copy(alpha = 0.28f)
 
             Scaffold(
                 contentWindowInsets = WindowInsets.safeDrawing,
+                containerColor = MaterialTheme.colorScheme.background,
                 snackbarHost = { SnackbarHost(hostState = snackbarHostState) },
                 topBar = {
-                    CenterAlignedTopAppBar(
-                        title = {
-                            Row(
-                                verticalAlignment = Alignment.CenterVertically,
-                            ) {
-                                Text(
-                                    text = stringResource(R.string.app_name),
-                                    style = MaterialTheme.typography.titleLarge,
-                                    fontWeight = FontWeight.Bold,
-                                )
-                                if (uiState.telemetry.status == TunnelStatus.CONNECTED) {
-                                    Spacer(Modifier.width(8.dp))
-                                    Surface(
-                                        shape = MaterialTheme.shapes.small,
-                                        color = SignalEmerald.copy(alpha = 0.16f),
-                                    ) {
-                                        val badgeLabel = if (uiState.selectedProfile?.profileType == ProfileType.WORKER_WS) {
-                                            "WS"
-                                        } else {
-                                            "SOCKS5"
+                    androidx.compose.foundation.layout.Column {
+                        CenterAlignedTopAppBar(
+                            title = {
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                ) {
+                                    Text(
+                                        text = stringResource(R.string.app_name),
+                                        style = MaterialTheme.typography.titleLarge,
+                                        fontWeight = FontWeight.Bold,
+                                    )
+                                    if (uiState.telemetry.status == TunnelStatus.CONNECTED) {
+                                        Spacer(Modifier.width(10.dp))
+                                        Surface(
+                                            shape = MaterialTheme.shapes.small,
+                                            color = SignalEmerald.copy(alpha = 0.14f),
+                                            border = androidx.compose.foundation.BorderStroke(
+                                                1.dp,
+                                                SignalEmerald.copy(alpha = 0.38f),
+                                            ),
+                                        ) {
+                                            val badgeLabel = if (uiState.selectedProfile?.profileType == ProfileType.WORKER_WS) {
+                                                "WS"
+                                            } else {
+                                                "SOCKS5"
+                                            }
+                                            Text(
+                                                text = badgeLabel,
+                                                style = MaterialTheme.typography.labelSmall,
+                                                fontWeight = FontWeight.SemiBold,
+                                                color = SignalEmerald,
+                                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp),
+                                            )
                                         }
-                                        Text(
-                                            text = badgeLabel,
-                                            style = MaterialTheme.typography.labelSmall,
-                                            color = SignalEmerald,
-                                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp),
-                                        )
                                     }
                                 }
-                            }
-                        },
-                        colors = TopAppBarDefaults.centerAlignedTopAppBarColors(
-                            containerColor = MaterialTheme.colorScheme.background,
-                        ),
-                    )
+                            },
+                            colors = TopAppBarDefaults.centerAlignedTopAppBarColors(
+                                containerColor = MaterialTheme.colorScheme.background,
+                            ),
+                        )
+                        androidx.compose.material3.HorizontalDivider(
+                            thickness = 1.dp,
+                            color = hairlineColor,
+                        )
+                    }
                 },
                 bottomBar = {
                     if (!useRail) {
-                        NavigationBar(
-                            containerColor = MaterialTheme.colorScheme.surface,
-                        ) {
-                            navTabs.forEach { tab ->
-                                val selected = currentRoute == tab.route
-                                NavigationBarItem(
-                                    selected = selected,
-                                    onClick = { navigateToTab(tab.route) },
-                                    icon = {
-                                        Icon(
-                                            imageVector = if (selected) tab.selectedIcon else tab.unselectedIcon,
-                                            contentDescription = stringResource(tab.labelRes),
-                                        )
-                                    },
-                                    label = { Text(stringResource(tab.labelRes)) },
-                                    modifier = Modifier.testTag(tab.testTag),
-                                )
+                        androidx.compose.foundation.layout.Column {
+                            androidx.compose.material3.HorizontalDivider(
+                                thickness = 1.dp,
+                                color = hairlineColor,
+                            )
+                            NavigationBar(
+                                containerColor = MaterialTheme.colorScheme.surface,
+                                tonalElevation = 0.dp,
+                            ) {
+                                navTabs.forEach { tab ->
+                                    val selected = currentRoute == tab.route
+                                    NavigationBarItem(
+                                        selected = selected,
+                                        onClick = { navigateToTab(tab.route) },
+                                        icon = {
+                                            Icon(
+                                                imageVector = if (selected) tab.selectedIcon else tab.unselectedIcon,
+                                                contentDescription = stringResource(tab.labelRes),
+                                            )
+                                        },
+                                        label = {
+                                            Text(
+                                                text = stringResource(tab.labelRes),
+                                                fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
+                                            )
+                                        },
+                                        colors = androidx.compose.material3.NavigationBarItemDefaults.colors(
+                                            selectedIconColor = MaterialTheme.colorScheme.primary,
+                                            selectedTextColor = MaterialTheme.colorScheme.primary,
+                                            indicatorColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.14f),
+                                            unselectedIconColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                                            unselectedTextColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        ),
+                                        modifier = Modifier.testTag(tab.testTag),
+                                    )
+                                }
                             }
                         }
                     }
@@ -290,11 +322,27 @@ fun SocksGuardApp(
                                             contentDescription = stringResource(tab.labelRes),
                                         )
                                     },
-                                    label = { Text(stringResource(tab.labelRes)) },
+                                    label = {
+                                        Text(
+                                            text = stringResource(tab.labelRes),
+                                            fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
+                                        )
+                                    },
+                                    colors = androidx.compose.material3.NavigationRailItemDefaults.colors(
+                                        selectedIconColor = MaterialTheme.colorScheme.primary,
+                                        selectedTextColor = MaterialTheme.colorScheme.primary,
+                                        indicatorColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.14f),
+                                        unselectedIconColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        unselectedTextColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    ),
                                     modifier = Modifier.testTag(tab.testTag),
                                 )
                             }
                         }
+                        androidx.compose.material3.VerticalDivider(
+                            thickness = 1.dp,
+                            color = hairlineColor,
+                        )
                     }
 
                     Box(modifier = Modifier.weight(1f).fillMaxSize()) {

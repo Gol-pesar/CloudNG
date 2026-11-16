@@ -160,6 +160,25 @@ class Socks5ProtocolTest {
     }
 
     @Test
+    fun `worker crypto buildInit handles ipv4 ipv6 and ipv4-mapped ipv6 cleanly`() {
+        val uuid = "11111111-2222-3333-4444-555555555555"
+        // Standard IPv4: 16 nonce + (1 ver + 2 port + 1 atyp + 4 ip) + 8 mac = 32 bytes; atyp=1
+        val v4 = com.example.worker.WorkerCrypto.buildInit(uuid, "172.67.70.244", 443)
+        assertEquals(32, v4.data.size)
+        assertEquals(1, (v4.data[16 + 3].toInt() xor v4.key[3].toInt()) and 0xFF)
+
+        // IPv4-mapped IPv6 (InetAddress returns 4-byte IPv4): must still encode as atyp=1, length=32
+        val mapped = com.example.worker.WorkerCrypto.buildInit(uuid, "::ffff:172.67.70.244", 443)
+        assertEquals(32, mapped.data.size)
+        assertEquals(1, (mapped.data[16 + 3].toInt() xor mapped.key[3].toInt()) and 0xFF)
+
+        // Real IPv6: 16 nonce + (1 ver + 2 port + 1 atyp + 16 ip) + 8 mac = 44 bytes; atyp=3
+        val v6 = com.example.worker.WorkerCrypto.buildInit(uuid, "2606:4700:4700::1111", 443)
+        assertEquals(44, v6.data.size)
+        assertEquals(3, (v6.data[16 + 3].toInt() xor v6.key[3].toInt()) and 0xFF)
+    }
+
+    @Test
     fun `traffic sniffer extracts TLS SNI and HTTP Host`() {
         val hostBytes = "www.wikipedia.org".toByteArray(Charsets.US_ASCII)
         val sniEntry = ByteArray(3 + hostBytes.size)

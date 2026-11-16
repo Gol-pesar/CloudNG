@@ -13,7 +13,7 @@ object WorkerDefaults {
     const val BUFFER_MAX = 4194304
     const val HANDSHAKE_TIMEOUT_MS = 5000
     const val CONNECT_TIMEOUT_MS = 15000L
-    const val ACK_TIMEOUT_MS = 10000L
+    const val ACK_TIMEOUT_MS = 18000L
 }
 
 data class InitPacket(val data: ByteArray, val key: ByteArray)
@@ -39,17 +39,24 @@ object WorkerCrypto {
         val nonce = ByteArray(16).also { rng.nextBytes(it) }
         val key = deriveKey(uuidStr, nonce)
 
+        val cleanHost = host.trim().removePrefix("[").removeSuffix("]").substringBefore('%')
+        val isV4 = cleanHost.matches(Regex("^\\d{1,3}(\\.\\d{1,3}){3}$"))
+        val isV6Literal = !isV4 && cleanHost.contains(":")
+
+        val literalBytes: ByteArray? = when {
+            isV4 -> runCatching { InetAddress.getByName(cleanHost).address }.getOrNull()
+            isV6Literal -> runCatching { InetAddress.getByName(cleanHost).address }.getOrNull()
+            else -> null
+        }
+
         val addrType: Int
         val addrBytes: ByteArray
-        val cleanHost = host.trim().removePrefix("[").removeSuffix("]")
-        val isV4 = cleanHost.matches(Regex("^\\d{1,3}(\\.\\d{1,3}){3}$"))
-        val isV6 = cleanHost.contains(":")
-        if (isV4) {
+        if (literalBytes != null && literalBytes.size == 4) {
             addrType = 1
-            addrBytes = InetAddress.getByName(cleanHost).address
-        } else if (isV6) {
+            addrBytes = literalBytes
+        } else if (literalBytes != null && literalBytes.size == 16) {
             addrType = 3
-            addrBytes = InetAddress.getByName(cleanHost).address
+            addrBytes = literalBytes
         } else {
             addrType = 2
             val hb = cleanHost.toByteArray(Charsets.UTF_8)

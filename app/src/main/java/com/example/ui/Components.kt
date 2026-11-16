@@ -160,12 +160,18 @@ fun ConnectionHeroCard(
         TunnelStatus.ERROR -> telemetry.errorMessage ?: stringResource(R.string.status_error)
     }
 
+    val hairlineBorder = if (status == TunnelStatus.DISCONNECTED) {
+        MaterialTheme.colorScheme.outline.copy(alpha = 0.34f)
+    } else {
+        statusColor.copy(alpha = 0.42f)
+    }
+
     Surface(
         modifier = modifier.fillMaxWidth(),
         shape = MaterialTheme.shapes.large,
         color = MaterialTheme.colorScheme.surface,
-        tonalElevation = 4.dp,
-        border = BorderStroke(1.dp, statusColor.copy(alpha = 0.35f)),
+        tonalElevation = 0.dp,
+        border = BorderStroke(1.dp, hairlineBorder),
     ) {
         Box(modifier = Modifier.fillMaxWidth()) {
             Image(
@@ -174,7 +180,7 @@ fun ConnectionHeroCard(
                 contentScale = ContentScale.Crop,
                 modifier = Modifier
                     .matchParentSize()
-                    .alpha(if (status == TunnelStatus.CONNECTED) 0.38f else 0.22f),
+                    .alpha(if (status == TunnelStatus.CONNECTED) 0.24f else 0.14f),
             )
 
             Box(
@@ -183,8 +189,9 @@ fun ConnectionHeroCard(
                     .background(
                         Brush.verticalGradient(
                             colors = listOf(
-                                MaterialTheme.colorScheme.surface.copy(alpha = 0.55f),
-                                MaterialTheme.colorScheme.surface.copy(alpha = 0.92f),
+                                MaterialTheme.colorScheme.surface.copy(alpha = 0.72f),
+                                statusColor.copy(alpha = if (status == TunnelStatus.CONNECTED) 0.08f else 0.03f),
+                                MaterialTheme.colorScheme.surface.copy(alpha = 0.96f),
                             ),
                         ),
                     ),
@@ -193,13 +200,13 @@ fun ConnectionHeroCard(
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(horizontal = 20.dp, vertical = 22.dp),
+                    .padding(horizontal = 22.dp, vertical = 24.dp),
                 horizontalAlignment = Alignment.CenterHorizontally,
             ) {
                 Surface(
                     shape = CircleShape,
-                    color = statusColor.copy(alpha = 0.16f),
-                    border = BorderStroke(1.dp, statusColor.copy(alpha = 0.45f)),
+                    color = statusColor.copy(alpha = 0.12f),
+                    border = BorderStroke(1.dp, statusColor.copy(alpha = 0.36f)),
                 ) {
                     Row(
                         modifier = Modifier.padding(horizontal = 14.dp, vertical = 6.dp),
@@ -208,13 +215,14 @@ fun ConnectionHeroCard(
                     ) {
                         Box(
                             modifier = Modifier
-                                .size(8.dp)
+                                .size(7.dp)
                                 .clip(CircleShape)
                                 .background(statusColor),
                         )
                         Text(
                             text = statusText,
                             style = MaterialTheme.typography.labelLarge,
+                            fontWeight = FontWeight.SemiBold,
                             color = statusColor,
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis,
@@ -222,46 +230,53 @@ fun ConnectionHeroCard(
                     }
                 }
 
-                Spacer(modifier = Modifier.height(20.dp))
+                Spacer(modifier = Modifier.height(22.dp))
 
                 Box(
                     contentAlignment = Alignment.Center,
-                    modifier = Modifier.size(154.dp),
+                    modifier = Modifier.size(164.dp),
                 ) {
                     Canvas(modifier = Modifier.fillMaxSize()) {
                         val center = Offset(size.width / 2f, size.height / 2f)
                         val maxRadius = size.minDimension / 2f
+                        // Subtle fixed precision orbital ring
+                        drawCircle(
+                            color = statusColor.copy(alpha = if (status == TunnelStatus.CONNECTED) 0.26f else 0.14f),
+                            radius = maxRadius * 0.80f,
+                            center = center,
+                            style = Stroke(width = 1.dp.toPx()),
+                        )
                         if (status == TunnelStatus.CONNECTED || status == TunnelStatus.CONNECTING) {
-                            val r1 = (maxRadius * 0.65f) + (maxRadius * 0.35f * pulseProgress)
-                            val alpha1 = (1f - pulseProgress) * 0.55f
+                            val r1 = (maxRadius * 0.66f) + (maxRadius * 0.34f * pulseProgress)
+                            val alpha1 = (1f - pulseProgress) * 0.45f
                             drawCircle(
                                 color = statusColor.copy(alpha = alpha1),
                                 radius = r1,
                                 center = center,
-                                style = Stroke(width = 3.dp.toPx()),
+                                style = Stroke(width = 2.dp.toPx()),
                             )
                             val secondPhase = (pulseProgress + 0.5f) % 1f
-                            val r2 = (maxRadius * 0.65f) + (maxRadius * 0.35f * secondPhase)
-                            val alpha2 = (1f - secondPhase) * 0.4f
+                            val r2 = (maxRadius * 0.66f) + (maxRadius * 0.34f * secondPhase)
+                            val alpha2 = (1f - secondPhase) * 0.32f
                             drawCircle(
                                 color = statusColor.copy(alpha = alpha2),
                                 radius = r2,
                                 center = center,
-                                style = Stroke(width = 2.dp.toPx()),
+                                style = Stroke(width = 1.5.dp.toPx()),
                             )
                         } else {
                             drawCircle(
-                                color = statusColor.copy(alpha = 0.22f),
-                                radius = maxRadius * 0.84f,
+                                color = statusColor.copy(alpha = 0.08f),
+                                radius = maxRadius * 0.94f,
                                 center = center,
-                                style = Stroke(width = 1.5.dp.toPx()),
+                                style = Stroke(width = 1.dp.toPx()),
                             )
                         }
                     }
 
                     Surface(
                         modifier = Modifier
-                            .size(106.dp)
+                            .size(108.dp)
                             .scale(buttonScale)
                             .clip(CircleShape)
                             .clickable(onClick = onToggleConnection)
@@ -272,15 +287,38 @@ fun ConnectionHeroCard(
                         } else {
                             MaterialTheme.colorScheme.surfaceVariant
                         },
-                        border = BorderStroke(2.5.dp, statusColor),
-                        shadowElevation = 10.dp,
+                        border = BorderStroke(
+                            width = 2.dp,
+                            color = if (status == TunnelStatus.CONNECTED) {
+                                Color.White.copy(alpha = 0.35f)
+                            } else {
+                                statusColor.copy(alpha = 0.85f)
+                            },
+                        ),
+                        shadowElevation = if (status == TunnelStatus.CONNECTED) 12.dp else 4.dp,
                     ) {
-                        Box(contentAlignment = Alignment.Center) {
+                        Box(
+                            contentAlignment = Alignment.Center,
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .background(
+                                    Brush.verticalGradient(
+                                        colors = if (status == TunnelStatus.CONNECTED) {
+                                            listOf(Color.White.copy(alpha = 0.16f), Color.Transparent)
+                                        } else {
+                                            listOf(
+                                                MaterialTheme.colorScheme.primary.copy(alpha = 0.06f),
+                                                Color.Transparent,
+                                            )
+                                        },
+                                    ),
+                                ),
+                        ) {
                             if (status == TunnelStatus.CONNECTING) {
                                 CircularProgressIndicator(
-                                    modifier = Modifier.size(38.dp),
+                                    modifier = Modifier.size(36.dp),
                                     color = statusColor,
-                                    strokeWidth = 3.dp,
+                                    strokeWidth = 2.5.dp,
                                 )
                             } else {
                                 Icon(
@@ -291,14 +329,14 @@ fun ConnectionHeroCard(
                                     } else {
                                         statusColor
                                     },
-                                    modifier = Modifier.size(44.dp),
+                                    modifier = Modifier.size(42.dp),
                                 )
                             }
                         }
                     }
                 }
 
-                Spacer(modifier = Modifier.height(14.dp))
+                Spacer(modifier = Modifier.height(16.dp))
 
                 Text(
                     text = when (status) {
@@ -307,6 +345,7 @@ fun ConnectionHeroCard(
                         else -> stringResource(R.string.action_connect)
                     },
                     style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.SemiBold,
                     color = MaterialTheme.colorScheme.onSurface,
                 )
 
@@ -318,16 +357,28 @@ fun ConnectionHeroCard(
                             text = Formatters.formatDuration(telemetry.connectedSinceMs, nowMs),
                             fontFamily = JetBrainsMonoFontFamily,
                             fontWeight = FontWeight.Bold,
-                            fontSize = 20.sp,
+                            fontSize = 22.sp,
+                            letterSpacing = 1.sp,
                             color = statusColor,
                         )
                         if (selectedProfile != null) {
-                            Text(
-                                text = "SOCKS5 Listen: 127.0.0.1:${selectedProfile.localPort}",
-                                fontFamily = JetBrainsMonoFontFamily,
-                                fontSize = 11.sp,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            )
+                            Spacer(modifier = Modifier.height(4.dp))
+                            Surface(
+                                shape = MaterialTheme.shapes.small,
+                                color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.7f),
+                                border = BorderStroke(
+                                    1.dp,
+                                    MaterialTheme.colorScheme.outline.copy(alpha = 0.25f),
+                                ),
+                            ) {
+                                Text(
+                                    text = "SOCKS5 • 127.0.0.1:${selectedProfile.localPort}",
+                                    fontFamily = JetBrainsMonoFontFamily,
+                                    fontSize = 11.sp,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp),
+                                )
+                            }
                         }
                     }
                 } else if (selectedProfile != null) {
@@ -337,14 +388,24 @@ fun ConnectionHeroCard(
                         } else {
                             "SOCKS5"
                         }
-                        Text(
-                            text = "$prefix • ${selectedProfile.endpoint}",
-                            fontFamily = JetBrainsMonoFontFamily,
-                            fontSize = 12.sp,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                        )
+                        Surface(
+                            shape = MaterialTheme.shapes.small,
+                            color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f),
+                            border = BorderStroke(
+                                1.dp,
+                                MaterialTheme.colorScheme.outline.copy(alpha = 0.22f),
+                            ),
+                        ) {
+                            Text(
+                                text = "$prefix • ${selectedProfile.endpoint}",
+                                fontFamily = JetBrainsMonoFontFamily,
+                                fontSize = 11.sp,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp),
+                            )
+                        }
                     }
                 } else {
                     Text(
@@ -365,7 +426,7 @@ fun TelemetrySparkline(
 ) {
     val rxColor = MaterialTheme.colorScheme.primary
     val txColor = MaterialTheme.colorScheme.secondary
-    val gridColor = MaterialTheme.colorScheme.outline.copy(alpha = 0.25f)
+    val gridColor = MaterialTheme.colorScheme.outline.copy(alpha = 0.16f)
 
     Canvas(modifier = modifier) {
         val w = size.width
@@ -387,44 +448,58 @@ fun TelemetrySparkline(
         val maxRate = samples.maxOf { maxOf(it.rxBytesPerSec, it.txBytesPerSec) }.coerceAtLeast(1024L)
         val stepX = w / (samples.size - 1).coerceAtLeast(1)
 
-        val rxLine = Path()
-        val rxFill = Path()
-        val txLine = Path()
-
-        samples.forEachIndexed { idx, sample ->
+        val rxPoints = samples.mapIndexed { idx, sample ->
             val x = idx * stepX
-            val rxY = h - ((sample.rxBytesPerSec.toFloat() / maxRate.toFloat()) * (h * 0.85f)) - (h * 0.05f)
-            val txY = h - ((sample.txBytesPerSec.toFloat() / maxRate.toFloat()) * (h * 0.85f)) - (h * 0.05f)
-
-            if (idx == 0) {
-                rxLine.moveTo(x, rxY)
-                rxFill.moveTo(x, h)
-                rxFill.lineTo(x, rxY)
-                txLine.moveTo(x, txY)
-            } else {
-                rxLine.lineTo(x, rxY)
-                rxFill.lineTo(x, rxY)
-                txLine.lineTo(x, txY)
-            }
+            val y = h - ((sample.rxBytesPerSec.toFloat() / maxRate.toFloat()) * (h * 0.84f)) - (h * 0.06f)
+            Offset(x, y)
         }
-        rxFill.lineTo((samples.size - 1) * stepX, h)
-        rxFill.close()
+        val txPoints = samples.mapIndexed { idx, sample ->
+            val x = idx * stepX
+            val y = h - ((sample.txBytesPerSec.toFloat() / maxRate.toFloat()) * (h * 0.84f)) - (h * 0.06f)
+            Offset(x, y)
+        }
+
+        fun buildSmoothPath(points: List<Offset>, closeToBottom: Boolean): Path {
+            val path = Path()
+            if (points.isEmpty()) return path
+            if (closeToBottom) {
+                path.moveTo(points.first().x, h)
+                path.lineTo(points.first().x, points.first().y)
+            } else {
+                path.moveTo(points.first().x, points.first().y)
+            }
+            for (i in 0 until points.size - 1) {
+                val p0 = points[i]
+                val p1 = points[i + 1]
+                val ctrlX = (p0.x + p1.x) / 2f
+                path.cubicTo(ctrlX, p0.y, ctrlX, p1.y, p1.x, p1.y)
+            }
+            if (closeToBottom) {
+                path.lineTo(points.last().x, h)
+                path.close()
+            }
+            return path
+        }
+
+        val rxLine = buildSmoothPath(rxPoints, closeToBottom = false)
+        val rxFill = buildSmoothPath(rxPoints, closeToBottom = true)
+        val txLine = buildSmoothPath(txPoints, closeToBottom = false)
 
         drawPath(
             path = rxFill,
             brush = Brush.verticalGradient(
-                colors = listOf(rxColor.copy(alpha = 0.30f), Color.Transparent),
+                colors = listOf(rxColor.copy(alpha = 0.22f), Color.Transparent),
             ),
         )
         drawPath(
             path = txLine,
-            color = txColor.copy(alpha = 0.8f),
-            style = Stroke(width = 2.dp.toPx(), cap = StrokeCap.Round, join = StrokeJoin.Round),
+            color = txColor.copy(alpha = 0.82f),
+            style = Stroke(width = 1.75.dp.toPx(), cap = StrokeCap.Round, join = StrokeJoin.Round),
         )
         drawPath(
             path = rxLine,
             color = rxColor,
-            style = Stroke(width = 2.5.dp.toPx(), cap = StrokeCap.Round, join = StrokeJoin.Round),
+            style = Stroke(width = 2.25.dp.toPx(), cap = StrokeCap.Round, join = StrokeJoin.Round),
         )
     }
 }
