@@ -387,6 +387,9 @@ class Socks5ProtocolTest {
         assertEquals(6, outBytes[9].toInt() and 0xFF)
         assertEquals(0x12, outBytes[33].toInt() and 0xFF) // SYN + ACK
         assertEquals(0x70, outBytes[32].toInt() and 0xFF) // dataOffset = 7 (28 bytes)
+        assertEquals(2, outBytes[40].toInt() and 0xFF) // MSS option kind
+        assertEquals(0x05, outBytes[42].toInt() and 0xFF) // MSS 1440 hi byte
+        assertEquals(0xA0, outBytes[43].toInt() and 0xFF) // MSS 1440 lo byte
         assertEquals(3, outBytes[45].toInt() and 0xFF) // WSCALE option kind
         assertEquals(7, outBytes[47].toInt() and 0xFF) // our shift = 7
     }
@@ -540,6 +543,43 @@ class Socks5ProtocolTest {
             com.example.vpn.VpnSocketProtector.underlyingNetwork = null
             com.example.vpn.VpnSocketProtector.selfUidBypassed = false
         }
+    }
+
+    @Test
+    fun `raw websocket unrolled 4-byte masking handles medium non-aligned payloads`() {
+        val server = ServerSocket(0, 1, InetAddress.getByName("127.0.0.1"))
+        val xorKey = ByteArray(16) { (it * 13 + 5).toByte() }
+        val payloadSize = 515 // > 126 (16-bit extended length) and not divisible by 4 or 16
+        val testPayload = ByteArray(payloadSize) { ((it * 31 + 17) and 0xFF).toByte() }
+        val receivedOnServer = java.util.concurrent.atomic.AtomicReference<ByteArray?>()
+
+        val serverThread = thread {
+            server.use { srv ->
+                srv.accept().use { peer ->
+                    val input = DataInputStream(peer.getInputStream())
+                    val b0 = input.readUnsignedByte()
+                    val b1 = input.readUnsignedByte()
+                    assertEquals(0x82, b0)
+                    assertEquals(0xFE, b1) // masked + 126 extended len
+                    val len = input.readUnsignedShort()
+                    assertEquals(payloadSize, len)
+                    val mask = ByteArray(4).also { input.readFully(it) }
+                    val buf = ByteArray(len).also { input.readFully(it) }
+                    for (i in buf.indices) {
+                        buf[i] = (buf[i].toInt() xor mask[i and 3].toInt() xor xorKey[i and 15].toInt()).toByte()
+                    }
+                    receivedOnServer.set(buf)
+                }
+            }
+        }
+
+        val sock = java.net.Socket("127.0.0.1", server.localPort)
+        val ws = com.example.worker.RawWebSocket(sock)
+        ws.useCompat {
+            assertTrue(ws.sendBinary(testPayload, offset = 0, length = testPayload.size, xorKey = xorKey))
+        }
+        serverThread.join(3000)
+        assertTrue(testPayload.contentEquals(receivedOnServer.get()))
     }
 }
 

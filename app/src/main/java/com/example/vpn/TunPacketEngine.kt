@@ -32,6 +32,7 @@ import java.util.concurrent.ConcurrentLinkedDeque
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicReference
 import javax.net.ssl.SNIHostName
 import javax.net.ssl.SSLSocket
 import kotlin.random.Random
@@ -93,6 +94,7 @@ class TunPacketEngine(
         var cwndBytes: Long = INITIAL_CWND_BYTES
         var rtoMs: Long = INITIAL_RTO_MS
         var dupAckCount: Int = 0
+        var lastFastRetransmitMs: Long = 0L
         var lastAdvertisedWinBytes: Int = MAX_UPSTREAM_BUFFER_BYTES
         var socket: Socket? = null
         var workerSession: WorkerTunnelSession? = null
@@ -116,15 +118,39 @@ class TunPacketEngine(
         val expiresAtMs: Long,
     )
 
+    private class PersistentDohConnection(
+        val wsSession: WorkerTunnelSession,
+        val sslSocket: SSLSocket,
+        val input: java.io.BufferedInputStream,
+        val output: java.io.OutputStream,
+        val srv: ServerSocket,
+        val peer: Socket,
+        val pumpJob: Job,
+    ) {
+        @Volatile var closed = false
+        fun closeQuietly() {
+            closed = true
+            pumpJob.cancel()
+            runCatching { sslSocket.close() }
+            runCatching { peer.close() }
+            runCatching { srv.close() }
+            runCatching { wsSession.close() }
+        }
+    }
+
     private val tcpSessions = ConcurrentHashMap<SessionKey, TcpSession>()
     private val dnsCache = ConcurrentHashMap<String, DnsCacheEntry>()
     private val ipToDomainCache = ConcurrentHashMap<String, DomainCacheEntry>()
     private val inFlightDns = ConcurrentHashMap<String, CompletableDeferred<ByteArray?>>()
     private val writeLock = Any()
-    private val tunWriteChannel = Channel<ByteArray>(capacity = 2048)
+    private val tunWriteChannel = Channel<ByteArray>(capacity = Channel.UNLIMITED)
     private val engineClosed = AtomicBoolean(false)
     private val ipIdCounter = AtomicInteger(1)
     private val dnsSessionPool = ConcurrentLinkedDeque<WorkerTunnelSession>()
+    private val dohSessionPool = ConcurrentLinkedDeque<PersistentDohConnection>()
+    @Volatile
+    private var preferDohOverTcp53 = false
+    private val tcp53ConsecutiveFailures = AtomicInteger(0)
 
     @OptIn(ExperimentalCoroutinesApi::class)
     private val tunnelDispatcher = Dispatchers.IO.limitedParallelism(128)
@@ -133,7 +159,13 @@ class TunPacketEngine(
         try {
             for (pkt in tunWriteChannel) {
                 synchronized(writeLock) {
-                    runCatching { tunOutput.write(pkt) }
+                    runCatching {
+                        tunOutput.write(pkt)
+                        while (true) {
+                            val next = tunWriteChannel.tryReceive().getOrNull() ?: break
+                            tunOutput.write(next)
+                        }
+                    }
                 }
             }
         } catch (_: CancellationException) {
@@ -398,14 +430,18 @@ class TunPacketEngine(
                     payload.isEmpty() &&
                     !isFin &&
                     session.unacked.isNotEmpty() &&
-                    scaledWindow > 0L
+                    scaledWindow > 0L &&
+                    scaledWindow == prevWindow
                 ) {
                     session.dupAckCount++
-                    if (session.dupAckCount == 3 || (session.dupAckCount > 3 && session.dupAckCount % 3 == 0)) {
+                    val nowMs = System.currentTimeMillis()
+                    if (session.dupAckCount >= 3 && (nowMs - session.lastFastRetransmitMs) >= 80L) {
                         val firstEntry = session.unacked.firstEntry()
                         if (firstEntry != null) {
-                            session.cwndBytes = (session.cwndBytes / 2L).coerceAtLeast(MIN_CWND_BYTES)
-                            firstEntry.value.sentAtMs = System.currentTimeMillis()
+                            session.lastFastRetransmitMs = nowMs
+                            session.dupAckCount = 0
+                            session.cwndBytes = (session.cwndBytes * 3L / 4L).coerceAtLeast(MIN_CWND_BYTES)
+                            firstEntry.value.sentAtMs = nowMs
                             fastRetransmitSeq = firstEntry.key
                             fastRetransmitPayload = firstEntry.value.data
                             fastRetransmitAck = session.clientNextSeq
@@ -596,14 +632,20 @@ class TunPacketEngine(
     }
 
     private suspend fun sniffTargetHost(session: TcpSession, dstHost: String, dstPort: Int): String? {
-        // Wakes in <1ms on first payload; 120ms max wait protects slow phones from missing SNI
-        withTimeoutOrNull(120L) { session.firstPayloadSignal.await() }
+        // Wakes in <1ms on first payload; fast-path immediately once SNI/Host is found
+        withTimeoutOrNull(85L) { session.firstPayloadSignal.await() }
         if (session.closed.get()) return null
 
         val firstChunk = synchronized(session.lock) { session.pendingTx.firstOrNull() }
+        val fastSniff = firstChunk?.let { TrafficSniffer.sniffDomain(it, dstPort) }
+        if (fastSniff != null) {
+            return fastSniff
+        }
+
         if (firstChunk != null && TrafficSniffer.isIncompleteTlsClientHello(firstChunk)) {
-            // Wait up to 90ms for trailing segments of 2-3 segment Post-Quantum TLS 1.3 ClientHello
-            val deadline = System.currentTimeMillis() + 90L
+            // Wait briefly for trailing segment(s) of Post-Quantum TLS 1.3 ClientHello
+            val deadline = System.currentTimeMillis() + 50L
+            var lastLen = firstChunk.size
             while (!session.closed.get()) {
                 val combinedNow = synchronized(session.lock) {
                     if (session.pendingTx.size <= 1) firstChunk
@@ -616,11 +658,17 @@ class TunPacketEngine(
                         out.toByteArray()
                     }
                 }
+                TrafficSniffer.sniffDomain(combinedNow, dstPort)?.let { return it }
                 if (!TrafficSniffer.isIncompleteTlsClientHello(combinedNow)) break
                 val rem = deadline - System.currentTimeMillis()
                 if (rem <= 0L) break
-                withTimeoutOrNull(rem.coerceAtMost(30L)) { session.secondPayloadSignal.await() }
-                delay(12L)
+                if (combinedNow.size == lastLen) {
+                    withTimeoutOrNull(rem.coerceAtMost(20L)) { session.secondPayloadSignal.await() }
+                    if (synchronized(session.lock) { session.pendingTx.size <= 1 }) {
+                        delay(5L)
+                    }
+                }
+                lastLen = combinedNow.size
             }
         }
         if (session.closed.get()) return null
@@ -729,7 +777,7 @@ class TunPacketEngine(
             }
 
             // Pipelined downstream: readPlain() feeds bounded rxChannel while downJob writes to TUN
-            val rxChan = Channel<ByteArray>(capacity = 16)
+            val rxChan = Channel<ByteArray>(capacity = 64)
             val downJob = scope.launch(tunnelDispatcher) {
                 try {
                     for (chunk in rxChan) {
@@ -851,7 +899,7 @@ class TunPacketEngine(
                 }
             }
 
-            val rxChan = Channel<ByteArray>(capacity = 16)
+            val rxChan = Channel<ByteArray>(capacity = 64)
             val downJob = scope.launch(tunnelDispatcher) {
                 try {
                     for (chunk in rxChan) {
@@ -866,7 +914,7 @@ class TunPacketEngine(
             }
 
             val input: InputStream = socket.getInputStream()
-            val buffer = ByteArray(32768)
+            val buffer = ByteArray(65536)
             try {
                 while (!session.closed.get()) {
                     val read = input.read(buffer)
@@ -950,8 +998,8 @@ class TunPacketEngine(
                 val availWindow = (effectiveWindow - inFlight).coerceAtLeast(0L)
                 if (availWindow > 0L) {
                     val remaining = data.size - offset
-                    // Avoid Silly Window tiny slices unless this is the tail of the chunk
-                    if (availWindow >= MSS_BYTES || remaining <= availWindow) {
+                    // Send full MSS, tail, or whenever nothing is in flight / at least 512B open
+                    if (availWindow >= MSS_BYTES || remaining <= availWindow || inFlight == 0L || availWindow >= 512L) {
                         val maxLen = availWindow.coerceAtMost(MSS_BYTES.toLong()).toInt()
                         val end = (offset + maxLen).coerceAtMost(data.size)
                         val slice = data.copyOfRange(offset, end)
@@ -982,11 +1030,10 @@ class TunPacketEngine(
                     payload = sliceToSend!!,
                 )
             } else {
-                // Background rtoTickerJob handles retransmissions every 40ms; wait for ACK signal here
-                val signaled = withTimeoutOrNull(180L) { session.ackSignal.receive() }
+                val signaled = withTimeoutOrNull(80L) { session.ackSignal.receive() }
                 if (signaled == null && !session.closed.get()) {
                     stallCycles++
-                    if (stallCycles > 150) return false
+                    if (stallCycles > 300) return false
                 }
             }
         }
@@ -1164,6 +1211,12 @@ class TunPacketEngine(
         cacheKey: String,
     ): ByteArray? {
         VpnStateManager.recordTx(dnsQuery.size)
+
+        // If TCP:53 previously timed out or is blocked on this Worker/ProxyIP, go straight to fast Keep-Alive DoH
+        if (preferDohOverTcp53) {
+            resolveDnsOverWorkerDoh(dnsQuery, cacheKey)?.let { return it }
+        }
+
         val framed = ByteArray(2 + dnsQuery.size)
         framed[0] = ((dnsQuery.size ushr 8) and 0xFF).toByte()
         framed[1] = (dnsQuery.size and 0xFF).toByte()
@@ -1175,67 +1228,65 @@ class TunPacketEngine(
             targetDnsHost
         }
 
-        // Parallel pooled Worker TCP:53 attempts (never block all apps behind one global lock)
-        for (attempt in 0 until 2) {
-            var pooled = dnsSessionPool.pollFirst()
-            if (pooled != null && pooled.isClosed()) {
-                pooled = null
-            }
-            val wsSession = pooled ?: runCatching {
-                val dnsTarget = if (attempt == 0) effectiveDnsHost else "8.8.4.4"
-                WorkerWsClient.openTunnel(
-                    uuid = profile.uuid,
-                    workerHost = profile.workerHost,
-                    cleanIp = profile.cleanIp,
-                    subproto = profile.subproto,
-                    targetHost = dnsTarget,
-                    targetPort = 53,
-                    initialPayload = ByteArray(0),
-                    socketProtector = protectSocket,
-                ).apply { setReadTimeout(4000) }
-            }.getOrNull()
+        var pooled = dnsSessionPool.pollFirst()
+        if (pooled != null && pooled.isClosed()) {
+            pooled = null
+        }
+        val wsSession = pooled ?: runCatching {
+            WorkerWsClient.openTunnel(
+                uuid = profile.uuid,
+                workerHost = profile.workerHost,
+                cleanIp = profile.cleanIp,
+                subproto = profile.subproto,
+                targetHost = effectiveDnsHost,
+                targetPort = 53,
+                initialPayload = ByteArray(0),
+                socketProtector = protectSocket,
+                ackTimeoutOverrideMs = 2800,
+            ).apply { setReadTimeout(2800) }
+        }.getOrNull()
 
-            if (wsSession != null) {
-                try {
-                    if (!wsSession.sendPlain(framed)) {
-                        throw EOFException("DNS WS send failed")
-                    }
-                    val acc = ByteArrayOutputStream()
-                    while (true) {
-                        val chunk = wsSession.readPlain() ?: throw EOFException("DNS WS closed")
-                        acc.write(chunk)
-                        val bytes = acc.toByteArray()
-                        if (bytes.size >= 2) {
-                            val expectedLen = ((bytes[0].toInt() and 0xFF) shl 8) or (bytes[1].toInt() and 0xFF)
-                            if (bytes.size >= 2 + expectedLen && expectedLen in 12..4096) {
-                                val dnsResp = bytes.copyOfRange(2, 2 + expectedLen)
-                                VpnStateManager.recordRx(dnsResp.size)
-                                cacheDnsResponse(cacheKey, dnsQuery, dnsResp)
-                                if (dnsSessionPool.size < 3 && !engineClosed.get()) {
-                                    dnsSessionPool.offerFirst(wsSession)
-                                } else {
-                                    runCatching { wsSession.close() }
-                                }
-                                return dnsResp
+        if (wsSession != null) {
+            try {
+                if (!wsSession.sendPlain(framed)) {
+                    throw EOFException("DNS WS send failed")
+                }
+                val acc = ByteArrayOutputStream()
+                while (true) {
+                    val chunk = wsSession.readPlain() ?: throw EOFException("DNS WS closed")
+                    acc.write(chunk)
+                    val bytes = acc.toByteArray()
+                    if (bytes.size >= 2) {
+                        val expectedLen = ((bytes[0].toInt() and 0xFF) shl 8) or (bytes[1].toInt() and 0xFF)
+                        if (bytes.size >= 2 + expectedLen && expectedLen in 12..4096) {
+                            val dnsResp = bytes.copyOfRange(2, 2 + expectedLen)
+                            VpnStateManager.recordRx(dnsResp.size)
+                            cacheDnsResponse(cacheKey, dnsQuery, dnsResp)
+                            tcp53ConsecutiveFailures.set(0)
+                            if (dnsSessionPool.size < 4 && !engineClosed.get()) {
+                                dnsSessionPool.offerFirst(wsSession)
+                            } else {
+                                runCatching { wsSession.close() }
                             }
+                            return dnsResp
                         }
                     }
-                } catch (_: Throwable) {
-                    runCatching { wsSession.close() }
                 }
+            } catch (_: Throwable) {
+                runCatching { wsSession.close() }
             }
         }
 
-        // Reliable HTTPS DoH fallback over port 443 (dns.google) inside Worker tunnel
+        // TCP:53 failed/timed out (very common on Cloudflare Workers & ProxyIPs) -> flip to Keep-Alive DoH:443
+        if (tcp53ConsecutiveFailures.incrementAndGet() >= 1) {
+            preferDohOverTcp53 = true
+        }
         return resolveDnsOverWorkerDoh(dnsQuery, cacheKey)
     }
 
-    private fun resolveDnsOverWorkerDoh(
-        dnsQuery: ByteArray,
-        cacheKey: String,
-    ): ByteArray? {
+    private fun openPersistentDohConnection(): PersistentDohConnection? {
         return runCatching {
-            val session = WorkerWsClient.openTunnel(
+            val wsSession = WorkerWsClient.openTunnel(
                 uuid = profile.uuid,
                 workerHost = profile.workerHost,
                 cleanIp = profile.cleanIp,
@@ -1245,138 +1296,190 @@ class TunPacketEngine(
                 initialPayload = ByteArray(0),
                 socketProtector = protectSocket,
             )
-            try {
-                openTlsOverWorkerTunnel(session, "dns.google", 443, timeoutMs = 6000) { sslSock ->
-                    val reqHeaders = buildString {
-                        append("POST /dns-query HTTP/1.1\r\n")
-                        append("Host: dns.google\r\n")
-                        append("Content-Type: application/dns-message\r\n")
-                        append("Accept: application/dns-message\r\n")
-                        append("Content-Length: ").append(dnsQuery.size).append("\r\n")
-                        append("Connection: close\r\n\r\n")
-                    }.toByteArray(Charsets.US_ASCII)
-                    val out = sslSock.getOutputStream()
-                    out.write(reqHeaders)
-                    out.write(dnsQuery)
-                    out.flush()
-
-                    val raw = sslSock.getInputStream().readBytes()
-                    val headerEnd = indexOfHeaderEnd(raw)
-                    if (headerEnd <= 0 || headerEnd + 12 > raw.size) return@openTlsOverWorkerTunnel null
-                    val body = parseHttpBody(raw, headerEnd)
-                    if (body.size in 12..4096) {
-                        VpnStateManager.recordRx(body.size)
-                        cacheDnsResponse(cacheKey, dnsQuery, body)
-                        body
-                    } else {
-                        null
+            val srv = ServerSocket(0, 1, InetAddress.getByName("127.0.0.1"))
+            srv.soTimeout = 6000
+            val clientSock = Socket()
+            val peerSockRef = AtomicReference<Socket?>(null)
+            val pumpJob = scope.launch(Dispatchers.IO) {
+                runCatching {
+                    val peer = srv.accept()
+                    peerSockRef.set(peer)
+                    peer.tcpNoDelay = true
+                    val downPump = launch(Dispatchers.IO) {
+                        runCatching {
+                            val pOut = peer.getOutputStream()
+                            while (true) {
+                                val data = wsSession.readPlain() ?: break
+                                if (data.isNotEmpty()) {
+                                    pOut.write(data)
+                                    pOut.flush()
+                                }
+                            }
+                        }
+                        runCatching { peer.shutdownOutput() }
                     }
+                    val buf = ByteArray(16384)
+                    val pIn = peer.getInputStream()
+                    while (true) {
+                        val n = pIn.read(buf)
+                        if (n <= 0) break
+                        if (!wsSession.sendPlain(buf, 0, n)) break
+                    }
+                    downPump.cancel()
                 }
-            } finally {
-                session.close()
+                runCatching { peerSockRef.get()?.close() }
+                runCatching { srv.close() }
+                runCatching { wsSession.close() }
+            }
+            try {
+                clientSock.connect(srv.localSocketAddress, 6000)
+                clientSock.soTimeout = 5000
+                val factory = WorkerWsClient.getSharedSslSocketFactory()
+                val sslSock = factory.createSocket(clientSock, "dns.google", 443, true) as SSLSocket
+                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.N) {
+                    val params = sslSock.sslParameters
+                    params.serverNames = listOf(SNIHostName("dns.google"))
+                    params.endpointIdentificationAlgorithm = "HTTPS"
+                    sslSock.sslParameters = params
+                }
+                sslSock.soTimeout = 5000
+                sslSock.startHandshake()
+                val peer = peerSockRef.get() ?: clientSock
+                PersistentDohConnection(
+                    wsSession = wsSession,
+                    sslSocket = sslSock,
+                    input = java.io.BufferedInputStream(sslSock.getInputStream(), 16384),
+                    output = sslSock.getOutputStream(),
+                    srv = srv,
+                    peer = peer,
+                    pumpJob = pumpJob,
+                )
+            } catch (t: Throwable) {
+                pumpJob.cancel()
+                runCatching { clientSock.close() }
+                runCatching { peerSockRef.get()?.close() }
+                runCatching { srv.close() }
+                runCatching { wsSession.close() }
+                throw t
             }
         }.getOrNull()
     }
 
-    private fun <T> openTlsOverWorkerTunnel(
-        wsSession: WorkerTunnelSession,
-        sniHost: String,
-        port: Int,
-        timeoutMs: Int,
-        block: (SSLSocket) -> T,
-    ): T {
-        val srv = ServerSocket(0, 1, InetAddress.getByName("127.0.0.1"))
-        srv.soTimeout = timeoutMs
-        val clientSock = Socket()
-        var bridgePeer: Socket? = null
-        val pumpUp = scope.launch(Dispatchers.IO) {
-            runCatching {
-                val peer = srv.accept()
-                bridgePeer = peer
-                peer.tcpNoDelay = true
-                val downPump = launch(Dispatchers.IO) {
-                    runCatching {
-                        val pOut = peer.getOutputStream()
-                        while (true) {
-                            val data = wsSession.readPlain() ?: break
-                            if (data.isNotEmpty()) {
-                                pOut.write(data)
-                                pOut.flush()
-                            }
-                        }
+    private fun resolveDnsOverWorkerDoh(
+        dnsQuery: ByteArray,
+        cacheKey: String,
+    ): ByteArray? {
+        for (attempt in 0 until 2) {
+            var conn = dohSessionPool.pollFirst()
+            if (conn != null && (conn.closed || conn.sslSocket.isClosed || conn.wsSession.isClosed())) {
+                conn.closeQuietly()
+                conn = null
+            }
+            val activeConn = conn ?: openPersistentDohConnection() ?: continue
+            try {
+                val reqHeaders = buildString {
+                    append("POST /dns-query HTTP/1.1\r\n")
+                    append("Host: dns.google\r\n")
+                    append("Content-Type: application/dns-message\r\n")
+                    append("Accept: application/dns-message\r\n")
+                    append("Content-Length: ").append(dnsQuery.size).append("\r\n")
+                    append("Connection: keep-alive\r\n\r\n")
+                }.toByteArray(Charsets.US_ASCII)
+                activeConn.sslSocket.soTimeout = 4500
+                activeConn.output.write(reqHeaders)
+                activeConn.output.write(dnsQuery)
+                activeConn.output.flush()
+
+                val body = readHttp1ResponseBody(activeConn.input)
+                if (body != null && body.size in 12..4096) {
+                    VpnStateManager.recordRx(body.size)
+                    cacheDnsResponse(cacheKey, dnsQuery, body)
+                    if (dohSessionPool.size < 4 && !engineClosed.get() && !activeConn.closed) {
+                        dohSessionPool.offerFirst(activeConn)
+                    } else {
+                        activeConn.closeQuietly()
                     }
-                    runCatching { peer.shutdownOutput() }
+                    return body
                 }
-                val buf = ByteArray(16384)
-                val pIn = peer.getInputStream()
+                activeConn.closeQuietly()
+            } catch (_: Throwable) {
+                activeConn.closeQuietly()
+            }
+        }
+        return null
+    }
+
+    private fun readHttp1ResponseBody(input: java.io.BufferedInputStream): ByteArray? {
+        val headerBuf = ByteArrayOutputStream(256)
+        var last4 = 0
+        while (true) {
+            val b = input.read()
+            if (b == -1) return null
+            headerBuf.write(b)
+            last4 = (last4 shl 8) or (b and 0xFF)
+            if (last4 == 0x0D0A0D0A) break
+            if (headerBuf.size() > 8192) return null
+        }
+        val headerText = headerBuf.toString("US-ASCII")
+        val lines = headerText.split("\r\n")
+        val statusOk = lines.firstOrNull()?.contains(" 200") == true
+        if (!statusOk) return null
+
+        var contentLength = -1
+        var isChunked = false
+        for (i in 1 until lines.size) {
+            val line = lines[i]
+            if (line.isEmpty()) break
+            if (line.startsWith("Content-Length:", ignoreCase = true)) {
+                contentLength = line.substring(15).trim().toIntOrNull() ?: -1
+            } else if (line.startsWith("Transfer-Encoding:", ignoreCase = true) &&
+                line.contains("chunked", ignoreCase = true)
+            ) {
+                isChunked = true
+            }
+        }
+
+        if (contentLength in 1..65536) {
+            val body = ByteArray(contentLength)
+            var off = 0
+            while (off < contentLength) {
+                val r = input.read(body, off, contentLength - off)
+                if (r < 0) return null
+                off += r
+            }
+            return body
+        }
+
+        if (isChunked) {
+            val out = ByteArrayOutputStream()
+            val dis = DataInputStream(input)
+            while (true) {
+                val sizeBuf = ByteArrayOutputStream(16)
                 while (true) {
-                    val n = pIn.read(buf)
-                    if (n <= 0) break
-                    if (!wsSession.sendPlain(buf, 0, n)) break
+                    val b = dis.read()
+                    if (b == -1) return null
+                    if (b == '\n'.code) break
+                    if (b != '\r'.code) sizeBuf.write(b)
                 }
-                downPump.cancel()
+                val chunkLen = sizeBuf.toString("US-ASCII").substringBefore(';').trim().toIntOrNull(16) ?: return null
+                if (chunkLen == 0) {
+                    // Consume trailing CRLF after last-chunk
+                    while (true) {
+                        val b = dis.read()
+                        if (b == -1 || b == '\n'.code) break
+                    }
+                    break
+                }
+                val chunk = ByteArray(chunkLen)
+                dis.readFully(chunk)
+                out.write(chunk)
+                dis.read() // \r
+                dis.read() // \n
             }
-            runCatching { bridgePeer?.close() }
+            return out.toByteArray()
         }
-        try {
-            clientSock.connect(srv.localSocketAddress, timeoutMs)
-            clientSock.soTimeout = timeoutMs
-            val factory = WorkerWsClient.getSharedSslSocketFactory()
-            val sslSock = factory.createSocket(clientSock, sniHost, port, true) as SSLSocket
-            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.N) {
-                val params = sslSock.sslParameters
-                params.serverNames = listOf(SNIHostName(sniHost))
-                params.endpointIdentificationAlgorithm = "HTTPS"
-                sslSock.sslParameters = params
-            }
-            sslSock.soTimeout = timeoutMs
-            sslSock.startHandshake()
-            return block(sslSock)
-        } finally {
-            pumpUp.cancel()
-            runCatching { clientSock.close() }
-            runCatching { bridgePeer?.close() }
-            runCatching { srv.close() }
-        }
-    }
 
-    private fun indexOfHeaderEnd(data: ByteArray): Int {
-        for (i in 0 until data.size - 3) {
-            if (data[i] == '\r'.code.toByte() &&
-                data[i + 1] == '\n'.code.toByte() &&
-                data[i + 2] == '\r'.code.toByte() &&
-                data[i + 3] == '\n'.code.toByte()
-            ) {
-                return i + 4
-            }
-        }
-        return -1
-    }
-
-    private fun parseHttpBody(raw: ByteArray, bodyStart: Int): ByteArray {
-        val headerStr = String(raw, 0, bodyStart, Charsets.US_ASCII)
-        if (!headerStr.contains("Transfer-Encoding: chunked", ignoreCase = true)) {
-            return raw.copyOfRange(bodyStart, raw.size)
-        }
-        val out = ByteArrayOutputStream()
-        var p = bodyStart
-        while (p < raw.size) {
-            var lineEnd = p
-            while (lineEnd < raw.size - 1 &&
-                !(raw[lineEnd] == '\r'.code.toByte() && raw[lineEnd + 1] == '\n'.code.toByte())
-            ) {
-                lineEnd++
-            }
-            if (lineEnd >= raw.size - 1) break
-            val sizeHex = String(raw, p, lineEnd - p, Charsets.US_ASCII).substringBefore(';').trim()
-            val chunkLen = sizeHex.toIntOrNull(16) ?: break
-            p = lineEnd + 2
-            if (chunkLen == 0) break
-            val copyLen = chunkLen.coerceAtMost(raw.size - p)
-            out.write(raw, p, copyLen)
-            p += copyLen + 2
-        }
-        return out.toByteArray()
+        return null
     }
 
     private fun resolveDnsOverSocks5Tcp(
@@ -1557,6 +1660,10 @@ class TunPacketEngine(
             val dnsWs = dnsSessionPool.pollFirst() ?: break
             runCatching { dnsWs.close() }
         }
+        while (true) {
+            val dohConn = dohSessionPool.pollFirst() ?: break
+            dohConn.closeQuietly()
+        }
         ipToDomainCache.clear()
         inFlightDns.values.forEach { it.complete(null) }
         inFlightDns.clear()
@@ -1609,15 +1716,15 @@ class TunPacketEngine(
     }
 
     private fun sendTcpSynAck(session: TcpSession) {
-        // SYN-ACK window is always unscaled per RFC 1323; MSS = 1360 (0x05, 0x50)
+        // SYN-ACK window is always unscaled per RFC 1323; MSS = 1440 (0x05, 0xA0) matches 1500 TUN MTU
         val options = if (session.useWindowScale) {
             byteArrayOf(
-                0x02, 0x04, 0x05, 0x50,
+                0x02, 0x04, 0x05, 0xA0.toByte(),
                 0x01,
                 0x03, 0x03, OUR_WSCALE_SHIFT.toByte(),
             )
         } else {
-            byteArrayOf(0x02, 0x04, 0x05, 0x50)
+            byteArrayOf(0x02, 0x04, 0x05, 0xA0.toByte())
         }
         writeTcpPacketToTun(
             srcIp = session.dstIpBytes,
@@ -1971,12 +2078,12 @@ class TunPacketEngine(
         private const val FLAG_PSH = 0x08
         private const val FLAG_ACK = 0x10
         private const val OUR_WSCALE_SHIFT = 7
-        private const val MSS_BYTES = 1360
-        private const val INITIAL_CWND_BYTES = 14L * MSS_BYTES
-        private const val MIN_CWND_BYTES = 4L * MSS_BYTES
-        private const val MAX_CWND_BYTES = 512L * 1024L
-        private const val INITIAL_RTO_MS = 150L
-        private const val MAX_RTO_MS = 2000L
+        private const val MSS_BYTES = 1440
+        private const val INITIAL_CWND_BYTES = 128L * MSS_BYTES
+        private const val MIN_CWND_BYTES = 32L * MSS_BYTES
+        private const val MAX_CWND_BYTES = 2L * 1024L * 1024L
+        private const val INITIAL_RTO_MS = 600L
+        private const val MAX_RTO_MS = 3000L
         private const val MAX_RTO_RETRIES = 12
         private const val MAX_UPSTREAM_BUFFER_BYTES = 2 * 1024 * 1024
     }

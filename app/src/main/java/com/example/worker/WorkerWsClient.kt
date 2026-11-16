@@ -11,7 +11,6 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
 import java.io.BufferedInputStream
-import java.io.BufferedOutputStream
 import java.io.ByteArrayOutputStream
 import java.io.DataInputStream
 import java.io.EOFException
@@ -23,7 +22,9 @@ import java.net.InetSocketAddress
 import java.net.Socket
 import java.security.MessageDigest
 import java.security.SecureRandom
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ConcurrentLinkedDeque
+import java.util.concurrent.ThreadLocalRandom
 import java.util.concurrent.atomic.AtomicBoolean
 import javax.net.ssl.HttpsURLConnection
 import javax.net.ssl.SNIHostName
@@ -40,16 +41,10 @@ class RawWebSocket(
     preBufferedInput: BufferedInputStream? = null,
 ) {
     private val input = DataInputStream(preBufferedInput ?: BufferedInputStream(socket.getInputStream(), 65536))
-    private val output = BufferedOutputStream(socket.getOutputStream(), 65536)
+    private val rawOutput = socket.getOutputStream()
     private val writeLock = Any()
     private val closed = AtomicBoolean(false)
     val createdAtMs: Long = System.currentTimeMillis()
-
-    companion object {
-        private val threadLocalRng = object : ThreadLocal<SecureRandom>() {
-            override fun initialValue(): SecureRandom = SecureRandom()
-        }
-    }
 
     fun isClosed(): Boolean = closed.get() || socket.isClosed
 
@@ -59,13 +54,16 @@ class RawWebSocket(
 
     /**
      * Encrypts [plain] with [xorKey] (if non-null) and RFC 6455 4-byte mask
-     * in a single pass, writing a binary frame directly to the TLS socket.
+     * in a single pass, writing a single contiguous binary frame directly to the TLS socket.
      */
     fun sendBinary(plain: ByteArray, offset: Int = 0, length: Int = plain.size, xorKey: ByteArray? = null): Boolean {
         if (closed.get()) return false
         return try {
-            val mask = ByteArray(4)
-            threadLocalRng.get()!!.nextBytes(mask)
+            val maskInt = ThreadLocalRandom.current().nextInt()
+            val m0 = (maskInt ushr 24) and 0xFF
+            val m1 = (maskInt ushr 16) and 0xFF
+            val m2 = (maskInt ushr 8) and 0xFF
+            val m3 = maskInt and 0xFF
 
             val headerSize = when {
                 length < 126 -> 2 + 4
@@ -92,42 +90,50 @@ class RawWebSocket(
                     }
                 }
             }
-            frame[p++] = mask[0]
-            frame[p++] = mask[1]
-            frame[p++] = mask[2]
-            frame[p++] = mask[3]
+            frame[p++] = m0.toByte()
+            frame[p++] = m1.toByte()
+            frame[p++] = m2.toByte()
+            frame[p++] = m3.toByte()
 
-            val m0 = mask[0].toInt()
-            val m1 = mask[1].toInt()
-            val m2 = mask[2].toInt()
-            val m3 = mask[3].toInt()
+            val masks = intArrayOf(m0, m1, m2, m3)
             if (xorKey != null) {
-                for (i in 0 until length) {
-                    val m = when (i and 3) {
-                        0 -> m0
-                        1 -> m1
-                        2 -> m2
-                        else -> m3
-                    }
+                var i = 0
+                val limit4 = length and 3.inv()
+                while (i < limit4) {
+                    val base = offset + i
+                    val kOff = i and 15
+                    frame[p + i] = (plain[base].toInt() xor xorKey[kOff].toInt() xor m0).toByte()
+                    frame[p + i + 1] = (plain[base + 1].toInt() xor xorKey[(kOff + 1) and 15].toInt() xor m1).toByte()
+                    frame[p + i + 2] = (plain[base + 2].toInt() xor xorKey[(kOff + 2) and 15].toInt() xor m2).toByte()
+                    frame[p + i + 3] = (plain[base + 3].toInt() xor xorKey[(kOff + 3) and 15].toInt() xor m3).toByte()
+                    i += 4
+                }
+                while (i < length) {
                     val enc = plain[offset + i].toInt() xor xorKey[i and 15].toInt()
-                    frame[p + i] = (enc xor m).toByte()
+                    frame[p + i] = (enc xor masks[i and 3]).toByte()
+                    i++
                 }
             } else {
-                for (i in 0 until length) {
-                    val m = when (i and 3) {
-                        0 -> m0
-                        1 -> m1
-                        2 -> m2
-                        else -> m3
-                    }
-                    frame[p + i] = (plain[offset + i].toInt() xor m).toByte()
+                var i = 0
+                val limit4 = length and 3.inv()
+                while (i < limit4) {
+                    val base = offset + i
+                    frame[p + i] = (plain[base].toInt() xor m0).toByte()
+                    frame[p + i + 1] = (plain[base + 1].toInt() xor m1).toByte()
+                    frame[p + i + 2] = (plain[base + 2].toInt() xor m2).toByte()
+                    frame[p + i + 3] = (plain[base + 3].toInt() xor m3).toByte()
+                    i += 4
+                }
+                while (i < length) {
+                    frame[p + i] = (plain[offset + i].toInt() xor masks[i and 3]).toByte()
+                    i++
                 }
             }
 
             synchronized(writeLock) {
                 if (closed.get()) return false
-                output.write(frame)
-                output.flush()
+                rawOutput.write(frame)
+                rawOutput.flush()
             }
             true
         } catch (_: Throwable) {
@@ -140,8 +146,13 @@ class RawWebSocket(
         synchronized(writeLock) {
             if (closed.get()) return
             runCatching {
-                val mask = ByteArray(4)
-                threadLocalRng.get()!!.nextBytes(mask)
+                val maskInt = ThreadLocalRandom.current().nextInt()
+                val mask = byteArrayOf(
+                    ((maskInt ushr 24) and 0xFF).toByte(),
+                    ((maskInt ushr 16) and 0xFF).toByte(),
+                    ((maskInt ushr 8) and 0xFF).toByte(),
+                    (maskInt and 0xFF).toByte(),
+                )
                 val len = payload.size.coerceAtMost(125)
                 val hdr = ByteArray(2 + 4 + len)
                 hdr[0] = (0x80 or opcode).toByte()
@@ -150,8 +161,8 @@ class RawWebSocket(
                 for (i in 0 until len) {
                     hdr[6 + i] = (payload[i].toInt() xor mask[i and 3].toInt()).toByte()
                 }
-                output.write(hdr)
-                output.flush()
+                rawOutput.write(hdr)
+                rawOutput.flush()
             }
         }
     }
@@ -275,12 +286,12 @@ class WorkerTunnelSession(
 }
 
 /**
- * Maintains a small pool of fresh pre-connected TLS+WebSocket connections so browser requests
- * execute rapidly without wasting battery or hitting Cloudflare idle limits.
+ * Maintains a hot pool of pre-connected TLS+WebSocket connections so browser bursts
+ * execute with zero TCP/TLS/WS handshake latency.
  */
 object WorkerWsPool {
-    private const val POOL_SIZE = 4
-    private const val MAX_IDLE_AGE_MS = 9_000L
+    private const val POOL_SIZE = 10
+    private const val MAX_IDLE_AGE_MS = 22_000L
 
     private data class PoolConfig(
         val workerHost: String,
@@ -320,24 +331,27 @@ object WorkerWsPool {
                 val deficit = POOL_SIZE - warmSockets.size
                 if (deficit > 0) {
                     repeat(deficit) {
-                        launch {
-                            runCatching {
-                                val ws = WorkerWsClient.connectRawWebSocket(
-                                    workerHost = cur.workerHost,
-                                    cleanIp = cur.cleanIp,
-                                    subproto = cur.subproto,
-                                    socketProtector = activeProtector,
-                                )
-                                if (activeConfig == cur && warmSockets.size < POOL_SIZE) {
-                                    warmSockets.offerLast(ws)
-                                } else {
-                                    ws.close()
-                                }
-                            }
-                        }
+                        launch { refillOne(cur) }
                     }
                 }
-                withTimeoutOrNull(3000L) { refillSignal.receive() }
+                withTimeoutOrNull(5000L) { refillSignal.receive() }
+            }
+        }
+    }
+
+    private fun refillOne(cfg: PoolConfig) {
+        runCatching {
+            if (activeConfig != cfg || warmSockets.size >= POOL_SIZE) return
+            val ws = WorkerWsClient.connectRawWebSocket(
+                workerHost = cfg.workerHost,
+                cleanIp = cfg.cleanIp,
+                subproto = cfg.subproto,
+                socketProtector = activeProtector,
+            )
+            if (activeConfig == cfg && warmSockets.size < POOL_SIZE) {
+                warmSockets.offerLast(ws)
+            } else {
+                ws.close()
             }
         }
     }
@@ -349,6 +363,9 @@ object WorkerWsPool {
         while (true) {
             val ws = warmSockets.pollFirst() ?: return null
             refillSignal.trySend(Unit)
+            if (warmSockets.size <= 4) {
+                poolScope.launch { refillOne(cfg) }
+            }
             if (!ws.isClosed() && (now - ws.createdAtMs) < MAX_IDLE_AGE_MS) {
                 return ws
             }
@@ -381,16 +398,20 @@ object WorkerWsPool {
 }
 
 object WorkerWsClient {
-    private const val CONNECT_TIMEOUT_MS = 8000
-    private const val TLS_HANDSHAKE_TIMEOUT_MS = 8000
+    private const val CONNECT_TIMEOUT_MS = 5000
+    private const val TLS_HANDSHAKE_TIMEOUT_MS = 5000
     private const val POOLED_ACK_TIMEOUT_MS = 16000
+    private const val DNS_CACHE_TTL_MS = 60_000L
+
+    private val resolvedHostCache = ConcurrentHashMap<String, Pair<Long, List<InetAddress>>>()
+    private val fastestCleanCandidate = ConcurrentHashMap<String, String>()
 
     private val sharedSslContext: SSLContext by lazy {
         SSLContext.getInstance("TLS").apply {
             init(null, null, null)
             runCatching {
-                clientSessionContext.sessionCacheSize = 128
-                clientSessionContext.sessionTimeout = 600
+                clientSessionContext.sessionCacheSize = 256
+                clientSessionContext.sessionTimeout = 900
             }
         }
     }
@@ -459,10 +480,18 @@ object WorkerWsClient {
         socketProtector: ((Socket) -> Boolean)? = null,
     ): RawWebSocket {
         val endpoint = parseWorkerEndpoint(workerHost)
-        val cleanCandidates = cleanIp
+        val rawList = cleanIp
             .split(',', ';', '\n', ' ')
             .map { it.trim() }
             .filter { it.isNotEmpty() }
+
+        val cacheKey = "${endpoint.host}|${cleanIp.trim()}"
+        val sticky = fastestCleanCandidate[cacheKey]
+        val cleanCandidates = if (sticky != null && rawList.contains(sticky)) {
+            listOf(sticky) + rawList.filter { it != sticky }
+        } else {
+            rawList
+        }
 
         var firstError: Throwable? = null
         for (rawCandidate in cleanCandidates) {
@@ -478,7 +507,10 @@ object WorkerWsClient {
                     socketProtector = socketProtector,
                 )
             }
-            if (attempt.isSuccess) return attempt.getOrThrow()
+            if (attempt.isSuccess) {
+                fastestCleanCandidate[cacheKey] = rawCandidate
+                return attempt.getOrThrow()
+            }
             if (firstError == null) {
                 firstError = attempt.exceptionOrNull()
             }
@@ -606,11 +638,23 @@ object WorkerWsClient {
         val clean = host.trim().removePrefix("[").removeSuffix("]")
         val literal = parseLiteralIp(clean)
         if (literal != null) return listOf(literal)
+
+        val now = System.currentTimeMillis()
+        val cached = resolvedHostCache[clean]
+        if (cached != null && (now - cached.first) < DNS_CACHE_TTL_MS) {
+            return cached.second
+        }
+
         val all = InetAddress.getAllByName(clean).toList()
-        if (all.size <= 1) return all
-        val v4 = all.filterIsInstance<Inet4Address>()
-        val v6 = all.filterIsInstance<Inet6Address>()
-        return (v4 + v6).take(3)
+        val ordered = if (all.size <= 1) {
+            all
+        } else {
+            val v4 = all.filterIsInstance<Inet4Address>()
+            val v6 = all.filterIsInstance<Inet6Address>()
+            (v4 + v6).take(3)
+        }
+        resolvedHostCache[clean] = now to ordered
+        return ordered
     }
 
     private fun parseLiteralIp(host: String): InetAddress? {
@@ -635,6 +679,7 @@ object WorkerWsClient {
         targetPort: Int,
         initialPayload: ByteArray = ByteArray(0),
         socketProtector: ((Socket) -> Boolean)? = null,
+        ackTimeoutOverrideMs: Int? = null,
     ): WorkerTunnelSession {
         val pooledWs = WorkerWsPool.acquire(workerHost, cleanIp, subproto)
         if (pooledWs != null) {
@@ -645,7 +690,7 @@ object WorkerWsClient {
                     targetHost = targetHost,
                     targetPort = targetPort,
                     initialPayload = initialPayload,
-                    ackTimeoutMs = POOLED_ACK_TIMEOUT_MS,
+                    ackTimeoutMs = ackTimeoutOverrideMs ?: POOLED_ACK_TIMEOUT_MS,
                 )
             } catch (_: Throwable) {
                 pooledWs.close()
@@ -660,7 +705,7 @@ object WorkerWsClient {
                 targetHost = targetHost,
                 targetPort = targetPort,
                 initialPayload = initialPayload,
-                ackTimeoutMs = WorkerDefaults.ACK_TIMEOUT_MS.toInt(),
+                ackTimeoutMs = ackTimeoutOverrideMs ?: WorkerDefaults.ACK_TIMEOUT_MS.toInt(),
             )
         } catch (t: Throwable) {
             fresh.close()

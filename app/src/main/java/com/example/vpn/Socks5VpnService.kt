@@ -339,7 +339,7 @@ class Socks5VpnService : VpnService() {
         val selfPkg = applicationContext.packageName
         val builder = Builder()
             .setSession("CloudNG - ${profile.name}")
-            .setMtu(1400)
+            .setMtu(1500)
             .addAddress("10.8.0.2", 24)
             .addDnsServer(dnsServer)
 
